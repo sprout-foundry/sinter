@@ -46,8 +46,8 @@ type CatalogModel struct {
 var ModelCatalog = []CatalogModel{
 	{
 		Name:            "gemma4-e2b",
-		Dir:             "gemma-4-e2b-it-4bit",
-		HFRepo:          "mlx-community/gemma-4-e2b-it-4bit",
+		Dir:             "gemma-4-e2b-it-5bit",
+		HFRepo:          "mlx-community/gemma-4-e2b-it-5bit",
 		MinRAMSelect:    0,
 		MinRAMSuggested: 0,
 	},

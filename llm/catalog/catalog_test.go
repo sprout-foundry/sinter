@@ -14,7 +14,7 @@ const testGB = 1024 * 1024 * 1024
 // automatic RAM-based resolution.
 func TestSelectModelForRAM(t *testing.T) {
 	root := t.TempDir()
-	for _, d := range []string{"gemma-4-e2b-it-4bit", "qwen3.5-4b-4bit", "qwen3.5-9b-4bit"} {
+	for _, d := range []string{"gemma-4-e2b-it-5bit", "qwen3.5-4b-4bit", "qwen3.5-9b-4bit"} {
 		if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -25,11 +25,11 @@ func TestSelectModelForRAM(t *testing.T) {
 		ram  uint64
 		want string // expected Dir basename, or "" for error
 	}{
-		{"1gb", 1 * testGB, "gemma-4-e2b-it-4bit"},
-		{"4gb", 4 * testGB, "gemma-4-e2b-it-4bit"},
+		{"1gb", 1 * testGB, "gemma-4-e2b-it-5bit"},
+		{"4gb", 4 * testGB, "gemma-4-e2b-it-5bit"},
 		// 8GB: qwen3.5-4b is only a STRETCH pick here (MinRAMSelect=8GB,
 		// MinRAMSuggested=16GB) — auto-selection must not pick it.
-		{"8gb", 8 * testGB, "gemma-4-e2b-it-4bit"},
+		{"8gb", 8 * testGB, "gemma-4-e2b-it-5bit"},
 		{"16gb", 16 * testGB, "qwen3.5-4b-4bit"},
 		{"24gb", 24 * testGB, "qwen3.5-9b-4bit"},
 		{"32gb", 32 * testGB, "qwen3.5-9b-4bit"}, // 35b-a3b never auto-selected
