@@ -59,6 +59,10 @@ type weights struct {
 	embed      *llm.Embedding
 	layers     []layerWeights
 	normWeight tensor.Array
+	// Untied lm_head (7B+ models): present only when
+	// tie_word_embeddings=false; logits then project through this instead
+	// of the tied embedding.
+	lmHead *linear
 }
 
 type layerWeights struct {
@@ -121,6 +125,19 @@ func (q *Qwen2) InitWeights(path string, s tensor.Stream) error {
 	w.embed, err = llm.LoadEmbedding(sf, "model.embed_tokens.weight", q.backend, s, q.cfg.Quantization)
 	if err != nil {
 		return fmt.Errorf("load embed_tokens: %w", err)
+	}
+
+	// Untied lm_head (7B+ Qwen2.5 models ship tie_word_embeddings=false):
+	// logits project through a separate head instead of the embedding.
+	// mlx-community layout stores it top-level as lm_head.weight.
+	if !q.cfg.UseTiedEmbeddings {
+		if !sf.Has("lm_head.weight") {
+			return fmt.Errorf("qwen2: tie_word_embeddings=false but no lm_head.weight found")
+		}
+		w.lmHead, err = llm.LoadLinear(sf, "lm_head.weight", q.backend, s, q.cfg.Quantization)
+		if err != nil {
+			return fmt.Errorf("load lm_head: %w", err)
+		}
 	}
 	w.normWeight, err = sf.Get("model.norm.weight", q.backend, s)
 	if err != nil {
@@ -371,8 +388,12 @@ func (q *Qwen2) computeLogits(h tensor.Array) (tensor.Array, error) {
 	}
 	defer normed.Free()
 
-	// Use the embedding's Logits method, which dispatches between full-
-	// precision MatMul and quantized mlx_quantized_matmul.
+	// Untied lm_head projects through the separate linear; tied models use
+	// the embedding's Logits method, which dispatches between full-precision
+	// MatMul and quantized mlx_quantized_matmul.
+	if q.weights.lmHead != nil {
+		return q.weights.lmHead.Forward(normed, q.backend, s)
+	}
 	return q.weights.embed.Logits(normed, q.backend, s)
 }
 
