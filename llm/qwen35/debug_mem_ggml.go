@@ -1,4 +1,4 @@
-//go:build linux && arm64 && cgo && ggml
+//go:build linux && (arm64 || amd64) && cgo && ggml
 
 package qwen35
 
