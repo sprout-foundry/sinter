@@ -60,6 +60,29 @@ func TestCatalogThresholdsMonotonic(t *testing.T) {
 	}
 }
 
+// TestMiniCPM5InCatalog pins MiniCPM5-2B's catalog placement: a 2B 4-bit
+// model fits anywhere (MinRAM 0 like gemma4-e2b), and the "largest fitting
+// suggested" rule must not let it shadow larger models on big machines —
+// with equal MinRAMSuggested (0), sortedCatalog keeps input order, so
+// gemma4-e2b (listed first) stays the suggested pick for small RAM and
+// qwen3.5-4b takes over from 16GB.
+func TestMiniCPM5InCatalog(t *testing.T) {
+	m := RecommendModelForRAM(4 * testGB)
+	if m.Name != "gemma4-e2b" && m.Name != "minicpm5-2b" {
+		t.Fatalf("small-RAM suggestion unexpectedly %s", m.Name)
+	}
+	// minicpm5-2b is known and selectable everywhere, including 1GB machines
+	// (as a warned stretch alternative to the gemma4 default).
+	status, known := SelectableForRAM("minicpm5-2b", 1*testGB)
+	if !known || status == TierBlocked {
+		t.Fatalf("minicpm5-2b at 1GB: known=%v status=%v, want known + selectable", known, status)
+	}
+	// At 128GB it must never be the suggested default (bigger models win).
+	if m := RecommendModelForRAM(128 * testGB); m.Name == "minicpm5-2b" {
+		t.Fatal("minicpm5-2b should not be the suggested default on a 128GB machine")
+	}
+}
+
 // TestRecommendModelForRAM checks the pure-RAM recommendation (the safe
 // "suggested" tier only).
 func TestRecommendModelForRAM(t *testing.T) {
