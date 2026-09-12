@@ -850,6 +850,18 @@ func (g *GGMLBackend) Name() string {
 	return g.name
 }
 
+// isCPUDevice reports whether the active ggml device is the CPU backend.
+// The custom C kernels (map_custom1/2, the fused gated-delta op) run only on
+// the CPU backend; GPU backends abort the process ("unsupported op") when
+// such a node lands in their graph, so every custom-op path must be gated
+// on this.
+func (g *GGMLBackend) isCPUDevice() bool {
+	if err := g.ensureInit(); err != nil {
+		return false
+	}
+	return g.name == "CPU"
+}
+
 func (g *GGMLBackend) Available() bool {
 	// GGML is available if the ggml build tag is set and a backend loads.
 	return g.ensureInit() == nil
@@ -2170,7 +2182,16 @@ func (g *GGMLBackend) Sigmoid(a tensor.Array, s tensor.Stream) (tensor.Array, er
 // SiLU computes silu(x) = x*sigmoid(x) with a custom kernel that matches the
 // ggml_sigmoid+ggml_mul sequence bit-for-bit, in a single op.
 func (g *GGMLBackend) SiLU(x tensor.Array, s tensor.Stream) (tensor.Array, error) {
-	out, err := g.evalOp(C.ggml_silu_custom(g.ctxPtr(), x.(*Array).cTensor()))
+	var t *C.struct_ggml_tensor
+	if g.isCPUDevice() {
+		t = C.ggml_silu_custom(g.ctxPtr(), x.(*Array).cTensor())
+	} else {
+		// GPU backends abort on the CPU-only map-custom op. The native
+		// kernel (x/(1+exp(-x))) differs from the custom sigmoid*mul
+		// sequence by at most 1 ulp.
+		t = C.ggml_silu(g.ctxPtr(), x.(*Array).cTensor())
+	}
+	out, err := g.evalOp(t)
 	if err != nil {
 		return nil, err
 	}
@@ -2179,16 +2200,27 @@ func (g *GGMLBackend) SiLU(x tensor.Array, s tensor.Stream) (tensor.Array, error
 	return out, nil
 }
 
-// SwiGLU computes silu(gate)*up with a custom kernel matching the
-// sigmoid+mul+mul fallback bit-for-bit, in a single op.
+// SwiGLU computes silu(gate)*up. On CPU the custom kernel matches the
+// sigmoid+mul+mul fallback bit-for-bit in a single op; GPU backends abort
+// on map-custom ops, so the standard multi-op sequence (SiLU + Multiply)
+// is used there.
 func (g *GGMLBackend) SwiGLU(gate, up tensor.Array, s tensor.Stream) (tensor.Array, error) {
-	out, err := g.evalOp(C.ggml_swiglu_custom(g.ctxPtr(), gate.(*Array).cTensor(), up.(*Array).cTensor()))
+	if g.isCPUDevice() {
+		t := C.ggml_swiglu_custom(g.ctxPtr(), gate.(*Array).cTensor(), up.(*Array).cTensor())
+		out, err := g.evalOp(t)
+		if err != nil {
+			return nil, err
+		}
+		out.logicalShape = append([]int(nil), gate.Shape()...)
+		g.registerArray(out)
+		return out, nil
+	}
+	gateSilu, err := g.SiLU(gate, s)
 	if err != nil {
 		return nil, err
 	}
-	out.logicalShape = append([]int(nil), gate.Shape()...)
-	g.registerArray(out)
-	return out, nil
+	defer gateSilu.Free()
+	return g.Multiply(gateSilu, up, s)
 }
 
 // GatedDeltaUpdate runs the full Gated DeltaNet recurrence in a single fused
@@ -2205,6 +2237,13 @@ func (g *GGMLBackend) SwiGLU(gate, up tensor.Array, s tensor.Stream) (tensor.Arr
 func (g *GGMLBackend) GatedDeltaUpdate(q, k, v, gTensor, beta, state tensor.Array, s tensor.Stream) (tensor.Array, tensor.Array, error) {
 	if err := g.ensureInit(); err != nil {
 		return nil, nil, err
+	}
+	if !g.isCPUDevice() {
+		// The fused recurrence is a CPU-only custom kernel. Returning an
+		// error makes the caller (llm/qwen35 delta dispatch) fall back to
+		// the per-step ops loop, which uses only standard ggml ops and is
+		// Metal-safe.
+		return nil, nil, fmt.Errorf("ggml: GatedDeltaUpdate fused kernel is CPU-only (device %s)", g.name)
 	}
 	qs := q.Shape()
 	if len(qs) != 4 {
@@ -3166,6 +3205,14 @@ func (g *GGMLBackend) causalMask(nQ, nKV int) (*C.struct_ggml_tensor, error) {
 // ── tensor.Backend: positional encoding ────────────────────────────
 
 func (g *GGMLBackend) FastRoPE(x tensor.Array, dims int, traditional bool, base float64, scale float32, offset int, freqs tensor.Array, s tensor.Stream) (tensor.Array, error) {
+	// Caller-supplied freq tables (Gemma proportional RoPE) cannot be
+	// expressed through ggml_rope_ext — its base parameter generates uniform
+	// base^(2i/d) frequencies and it never receives a table (base=0 callers
+	// would silently rotate with garbage frequencies). Route to the
+	// explicit-rotation path, which matches the MLX fast_rope contract.
+	if freqs != nil {
+		return g.fastRopeFreqs(x, dims, scale, offset, freqs, s)
+	}
 	ctx := g.ctxPtr()
 	mode := C.int(0)
 	if !traditional {
@@ -3694,171 +3741,121 @@ func f16tof32(h uint16) float32 {
 }
 
 // fastRopeFreqs implements FastRoPE for caller-supplied frequency tables
-// (Gemma's proportional RoPE: freqs[i]=base^(2i/dims), +inf marks dims that
-// do not rotate). ggml_rope_ext cannot express this — its base parameter
-// generates uniform frequencies and it never receives the table — so build
-// the rotation explicitly with elementwise ops on a normalized layout:
+// (Gemma's proportional RoPE). ggml_rope_ext cannot express this — its base
+// parameter generates uniform frequencies and it never receives the table —
+// so the rotation is built explicitly from elementwise ops.
 //
-//	x_out[2i]   = x[2i]*cos(pos*f_i) - x[2i+1]*sin(pos*f_i)
-//	x_out[2i+1] = x[2i+1]*cos(pos*f_i) + x[2i]*sin(pos*f_i)
+// The table follows the MLX fast_rope contract: entry i is the RECIPROCAL
+// frequency base^(2i/d) (Gemma builds 1000000^(2i/d)), so the applied angle
+// is theta_i = pos·scale/freqs[i]. +inf, NaN, or 0 entries mark dims that do
+// not rotate and map to theta=0 (identity), matching MLX's isinf behavior.
 //
-// Input arrives as [B,H,S,D] (the MLX attention convention, post-transpose);
-// it is first normalized to contiguous [B,S,H,D] so the S-axis cos/sin
-// broadcast and last-dim pairing are plain row-major, then transposed back.
-// inf freqs are replaced by 0 (theta=0 → cos=1, sin=0 → identity), matching
-// MLX's isinf→identity behavior.
-func (g *GGMLBackend) fastRopeFreqs(x tensor.Array, dims int, traditional bool, scale float32, offset int, freqs tensor.Array, s tensor.Stream) (tensor.Array, error) {
-	// Read the freq table (small: dims/2 floats) and sanitize infs.
-	f32, err := freqs.Float32Data()
-	if err != nil {
-		return nil, fmt.Errorf("ggml: rope freqs read: %w", err)
-	}
-	clean := make([]float32, len(f32))
-	for i, v := range f32 {
-		if math.IsInf(float64(v), 0) || math.IsNaN(float64(v)) {
-			clean[i] = 0 // theta 0 → identity rotation
-		} else {
-			clean[i] = v
-		}
-	}
-	numFreqs := len(clean)
-
-	shape := x.Shape() // [B, H, S, D]
+// Pairing matches MLX's base path (verified output-identical to
+// ggml_rope_ext NEOX mode): half-split, rotated in place:
+//
+//	out[i]     = x[i]·cos(θ_i) − x[i+D/2]·sin(θ_i)
+//	out[i+D/2] = x[i+D/2]·cos(θ_i) + x[i]·sin(θ_i)
+//
+// Input arrives as [B,H,S,D] (the MLX attention convention, post-transpose).
+// The two halves are GGML slice views of the last dim, so no token data
+// moves until the final concat.
+func (g *GGMLBackend) fastRopeFreqs(x tensor.Array, dims int, scale float32, offset int, freqs tensor.Array, s tensor.Stream) (tensor.Array, error) {
+	shape := x.Shape()
 	if len(shape) != 4 {
 		return nil, fmt.Errorf("ggml: rope freqs path needs rank 4 [B,H,S,D], got %v", shape)
 	}
 	B, H, S, D := shape[0], shape[1], shape[2], shape[3]
-	if numFreqs*2 != D {
-		return nil, fmt.Errorf("ggml: rope freqs count %d doesn't match head dim %d", numFreqs, D)
+	if D%2 != 0 {
+		return nil, fmt.Errorf("ggml: rope head dim %d must be even", D)
 	}
+	if dims > 0 && dims != D {
+		return nil, fmt.Errorf("ggml: rope dims %d != head dim %d", dims, D)
+	}
+	K := D / 2
 
-	// Normalize to contiguous [B, S, H, D].
-	xt, err := g.TransposeAxes(x, []int{0, 2, 1, 3}, s)
+	// Read the freq table (small: K floats) and convert to effective
+	// frequencies: theta = pos·scale/f. +inf/NaN/0 → identity.
+	f32, err := freqs.Float32Data()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("ggml: rope freqs read: %w", err)
 	}
-	defer xt.Free()
-
-	xEven, xOdd, err := g.splitEvenOdd(xt, D, s)
-	if err != nil {
-		return nil, err
+	if len(f32) != K {
+		return nil, fmt.Errorf("ggml: rope freqs count %d doesn't match head dim %d", len(f32), D)
 	}
-	defer xEven.Free()
-	defer xOdd.Free()
-
-	// cos/sin tables [S, numFreqs], broadcast to [B, S, H, numFreqs].
-	thetas := make([]float32, S*numFreqs)
-	for p := 0; p < S; p++ {
-		for i := 0; i < numFreqs; i++ {
-			thetas[p*numFreqs+i] = float32(offset+p) * clean[i]
+	lam := make([]float32, K)
+	for i, v := range f32 {
+		if !math.IsInf(float64(v), 0) && !math.IsNaN(float64(v)) && v != 0 {
+			lam[i] = float32(scale) / v
 		}
 	}
-	cosV := make([]float32, len(thetas))
-	sinV := make([]float32, len(thetas))
-	for i, th := range thetas {
-		cosV[i] = float32(math.Cos(float64(th)))
-		sinV[i] = float32(math.Sin(float64(th)))
+
+	// cos/sin tables [1,1,S,K], broadcast against [B,H,S,K].
+	cosV := make([]float32, S*K)
+	sinV := make([]float32, S*K)
+	for p := 0; p < S; p++ {
+		pos := float32(offset + p)
+		for i := 0; i < K; i++ {
+			th := pos * lam[i]
+			cosV[p*K+i] = float32(math.Cos(float64(th)))
+			sinV[p*K+i] = float32(math.Sin(float64(th)))
+		}
 	}
-	cosT, err := g.NewArrayFromFloat32(cosV, []int{1, S, 1, numFreqs})
+	cosT, err := g.NewArrayFromFloat32(cosV, []int{1, 1, S, K})
 	if err != nil {
 		return nil, err
 	}
 	defer cosT.Free()
-	sinT, err := g.NewArrayFromFloat32(sinV, []int{1, S, 1, numFreqs})
+	sinT, err := g.NewArrayFromFloat32(sinV, []int{1, 1, S, K})
 	if err != nil {
 		return nil, err
 	}
 	defer sinT.Free()
 
-	ec, err := g.Multiply(xEven, cosT, s)
+	// Half-split views of the last dim (GGML slices, no copy).
+	xLow, err := g.Slice(x, []int{0, 0, 0, 0}, []int{B, H, S, K}, []int{1, 1, 1, 1}, s)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("ggml: rope low-half view: %w", err)
 	}
-	defer ec.Free()
-	os_, err := g.Multiply(xOdd, sinT, s)
+	defer xLow.Free()
+	xHigh, err := g.Slice(x, []int{0, 0, 0, K}, []int{B, H, S, D}, []int{1, 1, 1, 1}, s)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("ggml: rope high-half view: %w", err)
 	}
-	defer os_.Free()
-	rotEven, err := g.Subtract(ec, os_, s)
-	if err != nil {
-		return nil, err
-	}
-	defer rotEven.Free()
+	defer xHigh.Free()
 
-	oc, err := g.Multiply(xOdd, cosT, s)
+	lc, err := g.Multiply(xLow, cosT, s)
 	if err != nil {
 		return nil, err
 	}
-	defer oc.Free()
-	es, err := g.Multiply(xEven, sinT, s)
+	defer lc.Free()
+	hs, err := g.Multiply(xHigh, sinT, s)
 	if err != nil {
 		return nil, err
 	}
-	defer es.Free()
-	rotOdd, err := g.Add(oc, es, s)
+	defer hs.Free()
+	rotLow, err := g.Subtract(lc, hs, s)
 	if err != nil {
 		return nil, err
 	}
-	defer rotOdd.Free()
+	defer rotLow.Free()
 
-	cat, err := g.ConcatenateAxis([]tensor.Array{rotEven, rotOdd}, 3, s)
+	hc, err := g.Multiply(xHigh, cosT, s)
 	if err != nil {
 		return nil, err
 	}
-	defer cat.Free()
-
-	// Back to [B, H, S, D].
-	out, err := g.TransposeAxes(cat, []int{0, 2, 1, 3}, s)
+	defer hc.Free()
+	lS, err := g.Multiply(xLow, sinT, s)
 	if err != nil {
 		return nil, err
 	}
-	_ = B
-	_ = H
-	return out, nil
-}
+	defer lS.Free()
+	rotHigh, err := g.Add(hc, lS, s)
+	if err != nil {
+		return nil, err
+	}
+	defer rotHigh.Free()
 
-// splitEvenOdd splits the last dim of x into even and odd elements:
-// even = x[..., 0::2], odd = x[..., 1::2]. GGML view ops cannot stride, so
-// this materializes two contiguous arrays from x's data.
-func (g *GGMLBackend) splitEvenOdd(x tensor.Array, headDim int, s tensor.Stream) (tensor.Array, tensor.Array, error) {
-	data, err := x.Float32Data()
-	if err != nil {
-		return nil, nil, err
-	}
-	shape := x.Shape()
-	n := len(data)
-	half := headDim / 2
-	rows := n / headDim
-	even := make([]float32, 0, rows*half)
-	odd := make([]float32, 0, rows*half)
-	for r := 0; r < rows; r++ {
-		base := r * headDim
-		for i := 0; i < half; i++ {
-			even = append(even, data[base+2*i])
-			odd = append(odd, data[base+2*i+1])
-		}
-	}
-	eShape := append([]int(nil), shape...)
-	eShape[len(eShape)-1] = half
-	eArr, err := g.NewArrayFromFloat32(even, eShape)
-	if err != nil {
-		return nil, nil, err
-	}
-	oShape := append([]int(nil), eShape...)
-	oArr, err := g.NewArrayFromFloat32(odd, oShape)
-	if err != nil {
-		eArr.Free()
-		return nil, nil, err
-	}
-	return eArr, oArr, nil
-}
-
-// interleaveEvenOdd rebuilds [..., headDim] from rotated even/odd halves.
-// With the non-interleaved RoPE convention, MLX's rope output layout equals
-// concat(even_rot, odd_rot, axis=-1), so a plain concat matches.
-func (g *GGMLBackend) interleaveEvenOdd(even, odd tensor.Array, headDim int, s tensor.Stream) (tensor.Array, error) {
-	return g.ConcatenateAxis([]tensor.Array{even, odd}, len(even.Shape())-1, s)
+	return g.ConcatenateAxis([]tensor.Array{rotLow, rotHigh}, 3, s)
 }
 
 // NewArrayQ8_0 converts F32 data (row-major [out, in] or any 2-D logical

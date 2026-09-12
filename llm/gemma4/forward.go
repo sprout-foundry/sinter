@@ -585,6 +585,17 @@ func (g *Gemma4) attention(h tensor.Array, lw *layerWeights, layerIdx int, isFul
 func (g *Gemma4) applyRoPE(x tensor.Array, isFull bool, offset, headDim int) (tensor.Array, error) {
 	s := g.stream
 	if isFull {
+		if os.Getenv("GEMMA4_ROPE_DEBUG") == "1" {
+			freqs := g.propRoPEFreqs
+			status := "nil"
+			if freqs != nil {
+				status = fmt.Sprintf("shape=%v", freqs.Shape())
+				if d, err := freqs.Float32Data(); err == nil {
+					status += fmt.Sprintf(" head=%v tail=%v", d[:2], d[len(d)-2:])
+				}
+			}
+			fmt.Printf("gemma4/rope L? full headDim=%d offset=%d freqs=%s\n", headDim, offset, status)
+		}
 		return g.backend.FastRoPE(x, headDim, false, 0, 1.0, offset, g.propRoPEFreqs, s)
 	}
 	return llm.ApplyRoPEFast(x, offset, headDim, 10000.0, g.backend, s)
