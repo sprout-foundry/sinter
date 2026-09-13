@@ -45,22 +45,22 @@ type CatalogModel struct {
 // long-term target once a clean export of the sprout-tuned models exists.
 var ModelCatalog = []CatalogModel{
 	{
-		Name:            "gemma4-e2b",
-		Dir:             "gemma-4-e2b-it-5bit",
-		HFRepo:          "mlx-community/gemma-4-e2b-it-5bit",
+		// MiniCPM5-2B (OpenBMB): dense 2B LlamaForCausalLM, 128K context.
+		// Runs on sinter's "llama" arch (qwen2 implementation — no QK norm,
+		// untied lm_head). Official OpenBMB MLX 4-bit export. Same always-
+		// fits tier as gemma4-e2b; listed FIRST so the equal-MinRAMSuggested
+		// input-order tie-break makes it the suggested default — SOTA for
+		// its size class and the right pick for 8GB machines.
+		Name:            "minicpm5-2b",
+		Dir:             "minicpm5-2b-mlx",
+		HFRepo:          "openbmb/MiniCPM5-2B-MLX",
 		MinRAMSelect:    0,
 		MinRAMSuggested: 0,
 	},
 	{
-		// MiniCPM5-2B (OpenBMB): dense 2B LlamaForCausalLM, 128K context.
-		// Runs on sinter's "llama" arch (qwen2 implementation — no QK norm,
-		// untied lm_head). Official OpenBMB MLX 4-bit export. Same tier as
-		// gemma4-e2b — a 2B 4-bit model fits on any machine — but ordered
-		// AFTER it so the existing suggested/eligible matrix is unchanged
-		// (equal MinRAMSuggested ties keep input order).
-		Name:            "minicpm5-2b",
-		Dir:             "minicpm5-2b-mlx",
-		HFRepo:          "openbmb/MiniCPM5-2B-MLX",
+		Name:            "gemma4-e2b",
+		Dir:             "gemma-4-e2b-it-5bit",
+		HFRepo:          "mlx-community/gemma-4-e2b-it-5bit",
 		MinRAMSelect:    0,
 		MinRAMSuggested: 0,
 	},
