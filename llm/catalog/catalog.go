@@ -88,6 +88,20 @@ var ModelCatalog = []CatalogModel{
 		MinRAMSelect:    32 * gb,
 		MinRAMSuggested: math.MaxUint64, // top-of-line: always an explicit, warned pick
 	},
+	{
+		// Edge0-35B-A3B-preview: the same qwen3_5_moe language model as the
+		// entry above, minus the vision tower and MTP head, with a rank-16
+		// Recover-LoRA shipped alongside the base checkpoint (merged at load
+		// — see llm/lora.go). Quantization and quality match the mlx-community
+		// build; the edge0 framework's SSD expert streaming (3 GiB active) is
+		// a runtime feature sinter does not implement, so the resident cost
+		// is the same ~18 GiB.
+		Name:            "edge0-35b-a3b",
+		Dir:             "Edge0-35b-a3b-preview",
+		HFRepo:          "Edge0/Edge0-35B-A3B-preview",
+		MinRAMSelect:    32 * gb,
+		MinRAMSuggested: math.MaxUint64,
+	},
 }
 
 // TierStatus classifies a catalog model against a specific RAM budget.
