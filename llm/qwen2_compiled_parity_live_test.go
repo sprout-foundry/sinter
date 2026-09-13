@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/sprout-foundry/sinter/llm/qwen2" // registers qwen2 + llama
 	"github.com/sprout-foundry/sinter/llm"
+	_ "github.com/sprout-foundry/sinter/llm/qwen2" // registers qwen2 + llama
 )
 
 // qwen2ParityModelDir returns the model dir for the qwen2/llama compiled-decode
