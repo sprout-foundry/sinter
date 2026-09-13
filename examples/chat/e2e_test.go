@@ -63,9 +63,19 @@ func isThinkingModel(dir string) bool {
 	return strings.Contains(string(data), "<think>")
 }
 
+// ggmlPlatform reports whether this machine can run the engine via the
+// GGML backend (linux/arm64 or linux/amd64 — includes Termux on Android,
+// where GOOS is "android" but the libc/kernel are Linux).
+func ggmlPlatform() bool {
+	gpu := runtime.GOOS == "linux" && (runtime.GOARCH == "arm64" || runtime.GOARCH == "amd64")
+	// GOOS is "android" on Termux; the linux build constraints in this
+	// module accept it, so mirror that here.
+	return gpu || (runtime.GOOS == "android" && runtime.GOARCH == "arm64")
+}
+
 func TestChatEndToEnd(t *testing.T) {
-	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
-		t.Skip("e2e generation requires the Metal backend (darwin/arm64)")
+	if runtime.GOOS != "darwin" && !ggmlPlatform() {
+		t.Skip("e2e generation requires the Metal backend (darwin/arm64) or GGML (linux)")
 	}
 	dirFlag := os.Getenv("SINTER_E2E_MODEL")
 	if dirFlag == "" {
@@ -134,7 +144,14 @@ func goBuildExample(t *testing.T) (string, error) {
 		return "", err
 	}
 	bin := filepath.Join(t.TempDir(), "sinter-chat")
-	build := exec.Command("go", "build", "-o", bin, "./examples/chat")
+	// Non-darwin needs the ggml build tag (backend selection + engine
+	// files are gated on it; see llm/architecture.go).
+	buildArgs := []string{"build", "-o", bin}
+	if runtime.GOOS != "darwin" {
+		buildArgs = append(buildArgs, "-tags", "ggml")
+	}
+	buildArgs = append(buildArgs, "./examples/chat")
+	build := exec.Command("go", buildArgs...)
 	build.Dir = root
 	if out, err := build.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("go build: %v\n%s", err, out)

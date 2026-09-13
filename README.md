@@ -51,11 +51,26 @@ Model catalog with RAM tiers and auto-selection lives in `llm/catalog`
 ## Development
 
 ```bash
-go build ./...   # requires mlx-c (brew) on macOS; stubs compile elsewhere
-go test ./...
+go build -tags ggml ./...   # GGML platforms (Linux, Termux/Android): needs libggml + libggml-base
+go build ./...              # macOS (Apple Silicon): needs mlx-c (brew); stubs compile elsewhere
+go test -tags ggml ./...    # or plain `go test ./...` on macOS
 ```
 
 Live-model tests (weights on disk) skip when the model is absent.
+
+### Termux (Android arm64)
+
+GOOS is `android` there, which every `linux`-gated file in this module accepts.
+
+1. `pkg install go clang` and `pkg install llama-cpp` for the ggml libs
+   (or point cgo at your own build — see step 3).
+2. `go build -tags ggml ./...` — Termux's clang finds ggml in `$PREFIX/lib`.
+3. Termux's packaged libggml-cpu is built for baseline armv8-a, which halves
+   quantized matmul throughput on dotprod/i8mm CPUs. Test:
+   `go test -tags ggml -run TestCPUQuantFastPaths ./tensor/ggml`. To fix,
+   build ggml with `-DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+i8mm`,
+   install to a private prefix, and build with
+   `CGO_CFLAGS=-I<prefix>/include CGO_LDFLAGS="-L<prefix>/lib -Wl,-rpath,<prefix>/lib"`.
 
 ## Example / e2e smoke test
 
