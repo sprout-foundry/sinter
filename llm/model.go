@@ -667,10 +667,16 @@ func (m *Model) generateLocked(ctx context.Context, prompt string, genCfg Genera
 	// generated token in some cases) — a real correctness bug, not yet
 	// root-caused. Do not flip this default without a passing parity test.
 	// Additionally, on the GGML backend (linux/android) the pipelined loop
-	// segfaults inside ggml_backend_graph_compute during the batch flush —
-	// reproducible 3/3 on qwen2 (Termux aarch64, 2026-09); likely a
-	// batch-graph lifetime bug in the pipelined path's still-chained
-	// pending nodes. Investigate before enabling there.
+	// segfaults inside ggml_backend_graph_compute — reproducible 3/3 on
+	// qwen2 (Termux aarch64, 2026-09), both with SINTER_GGML_BATCH on AND
+	// with =0, so it is the pipelined loop, not the batch flush. Leading
+	// hypothesis: eager op results are leaves in the recycled result
+	// context, and the pipelined loop keeps `pending` alive across an extra
+	// dispatch+readback cycle; if maybeRecycleResultCtx recycles that arena
+	// mid-window, the next graph build reads a zeroed node (crash signature
+	// is a null deref, consistent with recycled arena). Fix direction: pin
+	// pipelined outputs against result-ctx recycle (or copy them out at
+	// dispatch), then run llm/pipeline_parity_ggml_test.go.
 	usePipelined := useGPUArgmax && !useMTP && pipelinedOK && genCfg.MaxTokens > 1 && os.Getenv("SINTER_PIPELINE_DECODE") == "1"
 	// Compiled decode (CompiledGreedyArchitecture): the whole step runs as
 	// one MLX-compiled graph closure, replaying a cached execution plan
