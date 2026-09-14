@@ -419,6 +419,22 @@ type GenerateConfig struct {
 	// ThinkingTokens determines whether to include <think>...</think> blocks
 	// in the output. When false (default), thinking tokens are filtered.
 	ThinkingTokens bool
+	// EnableThinking controls the chat-template generation cue for
+	// thinking-capable models when FormatChat is asked for it (see
+	// FormatChatThinking). Qwen3.8-family reference templates think by
+	// default: the cue is an open <think>\n the model closes itself. When
+	// false, the closed empty <think>\n\n</think>\n\n cue tells the model
+	// to answer directly (the Qwen3.5 template's only mode). Has no effect
+	// on GenerationMode/EmptyThinkBlock families, which always use the
+	// closed cue, or on models without thinking tokens.
+	EnableThinking bool
+	// ReasoningFn, when non-nil, receives the assistant's thinking trace
+	// as it is decoded (text between <think> and </think>, markers
+	// excluded), enabling callers to surface reasoning_content while the
+	// answer streams separately. Tokens are still subject to
+	// ThinkingTokens filtering for onToken/GenerateText output — the
+	// reasoning trace arrives only through this callback.
+	ReasoningFn func(chunk string)
 }
 
 // DefaultGenerateConfig returns sensible defaults for concise generation.
@@ -1181,6 +1197,10 @@ func (m *Model) FormatChat(messages []ChatMessage) string {
 	return m.tokenizer.FormatChat(messages)
 }
 
+// Tokenizer exposes the loaded tokenizer (family detection, encoding
+// helpers). Nil-safe only after a successful NewModel* call.
+func (m *Model) Tokenizer() *Tokenizer { return m.tokenizer }
+
 // FormatChatForModel renders messages with the template variant that matches
 // the loaded model's own chat template. Qwen-family generation cues append an
 // empty <think>\n\n</think>\n\n block ("answer directly"); MiniCPM5's
@@ -1194,6 +1214,22 @@ func (m *Model) FormatChatForModel(messages []ChatMessage) string {
 		return m.tokenizer.formatMiniCPM5Chat(messages)
 	}
 	return m.tokenizer.FormatChat(messages)
+}
+
+// FormatChatThinking renders messages like FormatChatForModel but lets the
+// caller choose the thinking mode for models whose reference template
+// supports it (Qwen3.8 family: open <think>\n cue = thinking on, closed
+// empty block = off; the trace arrives via GenerateConfig.ReasoningFn).
+// Families whose template has no thinking toggle (Qwen3.5, MiniCPM5, LFM2 —
+// always the closed empty block; Gemma — none) ignore enableThinking and
+// behave exactly like FormatChatForModel. This keeps "thinking off" as the
+// universal default: a caller that never asks about thinking gets today's
+// behavior on every model.
+func (m *Model) FormatChatThinking(messages []ChatMessage, enableThinking bool) string {
+	if m.tokenizer != nil && m.tokenizer.marksPreserveThinking {
+		return m.tokenizer.formatPreserveThinkingChat(messages, enableThinking)
+	}
+	return m.FormatChatForModel(messages)
 }
 
 // FormatChatPrefix applies the chat template without the trailing
@@ -1567,11 +1603,20 @@ func (m *Model) shouldFilterToken(tokenID int, genCfg GenerateConfig) bool {
 	}
 	if m.endThinkID > 0 && tokenID == m.endThinkID {
 		m.inThinkBlock = false
+		if genCfg.ReasoningFn != nil {
+			genCfg.ReasoningFn("\n") // close off the trace with the template's newline
+		}
 		return true // drop the </think> marker itself
 	}
 
-	if m.inThinkBlock && !genCfg.ThinkingTokens {
-		return true // inside the thinking block — hide unless asked for it
+	if m.inThinkBlock {
+		if genCfg.ReasoningFn != nil {
+			genCfg.ReasoningFn(m.DecodeToken(tokenID))
+		}
+		if !genCfg.ThinkingTokens {
+			return true // inside the thinking block — hide unless asked for it
+		}
+		return false
 	}
 	if m.multimodalIDs[tokenID] {
 		return true // modality placeholder this text-only engine can't emit
