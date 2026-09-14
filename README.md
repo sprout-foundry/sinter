@@ -44,9 +44,10 @@ Model catalog with RAM tiers and auto-selection lives in `llm/catalog`
 | `SINTER_GGML_CPU` | Force GGML to CPU device (testing on any platform) |
 | `SINTER_ALLOW_OVERWEIGHT` | Skip the RAM gate for power users |
 | `SINTER_PREFIX_CACHE_MAX` | Override prefix-cache slot sizing |
-| `SINTER_PIPELINE_DECODE` | Opt in to pipelined decode |
+| `SINTER_PIPELINE_DECODE` | Pipelined decode opt-in — MLX only today: output diverges on darwin (parity test fails) and it segfaults on GGML (see llm/model.go) |
 | `SINTER_LOCAL_DEBUG` / `SINTER_GEN_MEM` | Engine + generation memory debug logging |
-| `SINTER_PIPELINE_DECODE`, `SINTER_COMPILED_DECODE`, `SINTER_MTP_*` | Experimental decode-path opt-ins (parity-tested) |
+| `SINTER_COMPILED_DECODE`, `SINTER_MTP_*` | Experimental decode-path opt-ins (parity-tested, MLX only) |
+| `SINTER_GGML_BATCH=0` | Disable GGML batched eval (on by default; restores eager per-op eval) |
 
 ## Development
 

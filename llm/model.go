@@ -666,6 +666,11 @@ func (m *Model) generateLocked(ctx context.Context, prompt string, genCfg Genera
 	// per-token path on every tested prompt (diverges from the first
 	// generated token in some cases) — a real correctness bug, not yet
 	// root-caused. Do not flip this default without a passing parity test.
+	// Additionally, on the GGML backend (linux/android) the pipelined loop
+	// segfaults inside ggml_backend_graph_compute during the batch flush —
+	// reproducible 3/3 on qwen2 (Termux aarch64, 2026-09); likely a
+	// batch-graph lifetime bug in the pipelined path's still-chained
+	// pending nodes. Investigate before enabling there.
 	usePipelined := useGPUArgmax && !useMTP && pipelinedOK && genCfg.MaxTokens > 1 && os.Getenv("SINTER_PIPELINE_DECODE") == "1"
 	// Compiled decode (CompiledGreedyArchitecture): the whole step runs as
 	// one MLX-compiled graph closure, replaying a cached execution plan
