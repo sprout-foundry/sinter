@@ -676,6 +676,13 @@ func (m *Model) generateLocked(ctx context.Context, prompt string, genCfg Genera
 	// tensor/ggml AsType/Int64Data: I32→I64 widens in Go with an explicit
 	// Eval of the argmax first; gated by
 	// TestPipelinedDecodeParityLiveModelGGML.
+	//
+	// Measured throughput (Termux aarch64, qwen2.5-0.5b-4bit, 15 paired
+	// runs interleaved with cooldowns): pipelined median 19.6 tok/s vs
+	// plain 20.3 — a wash. Expected: on GGML the batch-eval mode already
+	// absorbs per-op dispatch, which is the same overhead pipelining
+	// removes; on MLX (lazy graph + async eval) the overlap is additive
+	// rather than redundant, which is where this path was originally won.
 	usePipelined := useGPUArgmax && !useMTP && pipelinedOK && genCfg.MaxTokens > 1
 	if v := os.Getenv("SINTER_PIPELINE_DECODE"); v != "" {
 		usePipelined = v == "1" // explicit override (default ON; "0" opts out)
