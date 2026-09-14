@@ -177,6 +177,10 @@ func loraTensorF32(a tensor.Array, b tensor.Backend, s tensor.Stream) ([]float32
 // base weight has no A/B pair in the adapter (not a LoRA target), the base
 // weight loads through the plain path — callers pass every projection here
 // and only genuine adapter targets pay the merge cost.
+// LoadLinearLora loads a LoRA-merged projection: the base weight is dequantized
+// (or read plain, for non-quantized models), the adapter pair is merged in, and
+// the result is re-quantized. When a is nil (no adapter shipped alongside the
+// model), the plain linear is returned instead.
 func LoadLinearLora(sf *SafetensorsFile, name string, b tensor.Backend, s tensor.Stream, quant *QuantConfig, a *LoraAdapter) (*Linear, error) {
 	if a == nil {
 		return LoadLinear(sf, name, b, s, quant)
