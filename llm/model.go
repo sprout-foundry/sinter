@@ -436,8 +436,10 @@ func DefaultGenerateConfig() GenerateConfig {
 // Generate runs the autoregressive generation loop. It calls onToken for each
 // isStopToken reports whether the token should terminate generation.
 // Checks EOS and any architecture-specific StopTokenIDs (e.g. Gemma4's <turn|>).
+// The tokenID > 0 guard keeps the zero-value ModelConfig (EOSTokenID unset,
+// i.e. 0) from treating real id-0 tokens (<pad> in gemma4) as stop tokens.
 func (m *Model) isStopToken(tokenID int) bool {
-	if tokenID == m.cfg.EOSTokenID {
+	if tokenID > 0 && tokenID == m.cfg.EOSTokenID {
 		return true
 	}
 	for _, t := range m.cfg.StopTokenIDs {
@@ -1554,11 +1556,16 @@ func (m *Model) shouldFilterToken(tokenID int, genCfg GenerateConfig) bool {
 		return true
 	}
 
-	if tokenID == m.thinkID {
+	// The > 0 guards matter: IDOf returns 0 for "token not in vocab", and
+	// real tokenizers put real tokens at id 0 (gemma4 ships <pad> as added
+	// token 0). Without the guard, one emitted id-0 token on a model with no
+	// think markers would open a phantom think block and silently filter
+	// every following token until another id-0 closed it.
+	if m.thinkID > 0 && tokenID == m.thinkID {
 		m.inThinkBlock = true
 		return true // drop the <think> marker itself
 	}
-	if tokenID == m.endThinkID {
+	if m.endThinkID > 0 && tokenID == m.endThinkID {
 		m.inThinkBlock = false
 		return true // drop the </think> marker itself
 	}
