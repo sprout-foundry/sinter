@@ -230,6 +230,7 @@ int64_t tensor_ne(const struct ggml_tensor * t, int i) { return t->ne[i]; }
 
 // Get tensor op code.
 int tensor_op(const struct ggml_tensor * t) { return (int)t->op; }
+int tensor_type(const struct ggml_tensor * t) { return (int)t->type; }
 
 // Get a human-readable op name for tracing.
 const char * tensor_op_name(const struct ggml_tensor * t) { return ggml_op_name(t->op); }
@@ -888,19 +889,30 @@ func (g *GGMLBackend) resultCtxPtr() *C.struct_ggml_context {
 
 // opsArenaBytes sizes the recyclable graph-node arena. One op needs a handful
 // of tensors; this absorbs many ops between resets.
-const opsArenaBytes = 64 * 1024 * 1024
+// SINTER_GGML_OPS_ARENA overrides for debugging (huge value = never recycle,
+// which bisects stale-pointer crashes between the ops and result arenas).
+var opsArenaBytes = arenaBytesFromEnv("SINTER_GGML_OPS_ARENA", 64*1024*1024)
 
 // resultArenaBytes sizes the recyclable result-leaf arena. Result structs are
 // ~GGML_TENSOR_SIZE (~400 bytes) each; this holds a few thousand live/queued
 // results between recycles without pinning a large chunk of address space.
-const resultArenaBytes = 64 * 1024 * 1024
+var resultArenaBytes = arenaBytesFromEnv("SINTER_GGML_RESULT_ARENA", 64*1024*1024)
+
+func arenaBytesFromEnv(name string, def int) int {
+	if v := os.Getenv(name); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1<<20 {
+			return n
+		}
+	}
+	return def
+}
 
 // recycleOpsCtx re-inits the op arena once it is half full. Called at the end
 // of evalOp, the one point where no graph node is still needed: the result is
 // copied into its own buffer and the wrapper's nodes are dead.
 func (g *GGMLBackend) recycleOpsCtx() {
 	ctx := (*C.struct_ggml_context)(g.opsCtx)
-	if ctx == nil || uint64(C.ggml_ctx_used(ctx)) < opsArenaBytes/2 {
+	if ctx == nil || uint64(C.ggml_ctx_used(ctx)) < uint64(opsArenaBytes/2) {
 		return
 	}
 	C.ggml_free(ctx)
@@ -915,7 +927,7 @@ func (g *GGMLBackend) recycleOpsCtx() {
 // and every Array wrapper keeps working.
 func (g *GGMLBackend) maybeRecycleResultCtx() {
 	ctx := g.resultCtxPtr()
-	if ctx == nil || uint64(C.ggml_ctx_used(ctx)) < resultArenaBytes/2 {
+	if ctx == nil || uint64(C.ggml_ctx_used(ctx)) < uint64(resultArenaBytes/2) {
 		return
 	}
 
@@ -1282,6 +1294,17 @@ func (a *Array) Int64Data() ([]int64, error) {
 	n := a.Size()
 	data := make([]int64, n)
 	nbytes := C.size_t(n * 8)
+	if C.tensor_type(a.cTensor()) != C.GGML_TYPE_I64 {
+		// Non-I64 storage (e.g. an ArgMax result, which GGML produces as
+		// I32): read the elementwise values and widen. A raw byte get would
+		// read past the buffer (I32 data is half the size I64 read expects).
+		src := make([]int32, n)
+		C.ggml_backend_tensor_get(a.cTensor(), unsafe.Pointer(&src[0]), 0, C.size_t(n*4))
+		for i, v := range src {
+			data[i] = int64(v)
+		}
+		return data, nil
+	}
 	C.ggml_backend_tensor_get(a.cTensor(), unsafe.Pointer(&data[0]), 0, nbytes)
 	return data, nil
 }
@@ -1351,6 +1374,12 @@ func (g *GGMLBackend) newResultF32(data []float32, shape []int) (tensor.Array, e
 	raw := make([]byte, len(data)*4)
 	copy(raw, unsafe.Slice((*byte)(unsafe.Pointer(&data[0])), len(data)*4))
 	return g.newResultArray(raw, shape, C.GGML_TYPE_F32)
+}
+
+func (g *GGMLBackend) newResultI64(data []int64, shape []int) (tensor.Array, error) {
+	raw := make([]byte, len(data)*8)
+	copy(raw, unsafe.Slice((*byte)(unsafe.Pointer(&data[0])), len(data)*8))
+	return g.newResultArray(raw, shape, C.GGML_TYPE_I64)
 }
 
 func (g *GGMLBackend) newResultI32(data []int32, shape []int) (tensor.Array, error) {
@@ -1641,8 +1670,56 @@ func (g *GGMLBackend) AsType(a tensor.Array, dtype tensor.Dtype, s tensor.Stream
 	// GGML cast: create new tensor with target type and use ggml_cpy (which casts)
 	ctx := g.ctxPtr()
 	shape := ga.Shape()
+	srcType := ga.cTensor()._type
+	// The CPU backend has no I64 dup kernel (ops.cpp dup: GGML_TYPE_I32 src
+	// only handles dst F32; I64 src hits the default ABORT). Do any cast
+	// WITH an I64 source in Go — read the values, build a fresh pinned leaf.
+	// This also guarantees the result is a real copy, never a view aliasing
+	// recycled op-result storage (pipelined decode keeps these arrays alive
+	// across steps).
+	if srcType == C.GGML_TYPE_I32 && gt == C.GGML_TYPE_I64 {
+		// ArgMax produces I32; reads must widen in Go (same dup-kernel gap).
+		if err := ga.Eval(); err != nil {
+			return nil, err
+		}
+		src := make([]int32, product(shape))
+		C.ggml_backend_tensor_get(ga.cTensor(), unsafe.Pointer(&src[0]), 0, C.size_t(len(src)*4))
+		v := make([]int64, len(src))
+		for i, x := range src {
+			v[i] = int64(x)
+		}
+		return g.newResultI64(v, shape)
+	}
+	if srcType == C.GGML_TYPE_I64 {
+		i64data, err := ga.Int64Data()
+		if err != nil {
+			return nil, err
+		}
+		switch gt {
+		case C.GGML_TYPE_I64:
+			return g.newResultI64(i64data, shape)
+		case C.GGML_TYPE_I32:
+			v := make([]int32, len(i64data))
+			for i, x := range i64data {
+				v[i] = int32(x)
+			}
+			return g.newResultI32(v, shape)
+		case C.GGML_TYPE_F32:
+			v := make([]float32, len(i64data))
+			for i, x := range i64data {
+				v[i] = float32(x)
+			}
+			return g.newResultF32(v, shape)
+		default:
+			return nil, fmt.Errorf("ggml: AsType i64 -> %d not supported", int(gt))
+		}
+	}
 	target := createTensor(g, shape, gt)
 	result := C.ggml_cpy(ctx, ga.cTensor(), target)
+	if debugEnabled {
+		debugf("ggml: AsType %s -> %s shape=%v\n",
+			C.GoString(C.ggml_type_name(ga.cTensor()._type)), C.GoString(C.ggml_type_name(gt)), shape)
+	}
 	return g.evalOp(result)
 }
 

@@ -394,6 +394,9 @@ func (q *Qwen2) ForwardDecodeArgmaxArray(tokenArr tensor.Array, pos int, cache *
 
 	// Match the int64 dtype decodeInternal uses for ids (NewArrayFromInt64)
 	// so every step's embedding gather sees a consistent index dtype.
+	// The cast is a COPY into a fresh leaf (not a view): the caller frees
+	// logits/idx immediately and pipelines this array across steps, so it
+	// must not alias op-result storage.
 	idx64, err := q.backend.AsType(idx, tensor.Int64, q.stream)
 	idx.Free()
 	if err != nil {

@@ -661,23 +661,25 @@ func (m *Model) generateLocked(ctx context.Context, prompt string, genCfg Genera
 	// whole point of NOT reading back every step. Pipelining alone recovers
 	// the bulk of the gap against mlx-lm; prompt-lookup on top is future work.
 	pipelinedArch, pipelinedOK := m.arch.(PipelinedGreedyArchitecture)
-	// SINTER_PIPELINE_DECODE=1 opts in. Defaults OFF: TestPipelinedDecodeParityLiveModel
-	// found this path produces genuinely different output from the plain
-	// per-token path on every tested prompt (diverges from the first
-	// generated token in some cases) — a real correctness bug, not yet
-	// root-caused. Do not flip this default without a passing parity test.
-	// Additionally, on the GGML backend (linux/android) the pipelined loop
-	// segfaults inside ggml_backend_graph_compute — reproducible 3/3 on
-	// qwen2 (Termux aarch64, 2026-09), both with SINTER_GGML_BATCH on AND
-	// with =0, so it is the pipelined loop, not the batch flush. Leading
-	// hypothesis: eager op results are leaves in the recycled result
-	// context, and the pipelined loop keeps `pending` alive across an extra
-	// dispatch+readback cycle; if maybeRecycleResultCtx recycles that arena
-	// mid-window, the next graph build reads a zeroed node (crash signature
-	// is a null deref, consistent with recycled arena). Fix direction: pin
-	// pipelined outputs against result-ctx recycle (or copy them out at
-	// dispatch), then run llm/pipeline_parity_ggml_test.go.
-	usePipelined := useGPUArgmax && !useMTP && pipelinedOK && genCfg.MaxTokens > 1 && os.Getenv("SINTER_PIPELINE_DECODE") == "1"
+	// Pipelined decode is default ON where the arch implements it.
+	// SINTER_PIPELINE_DECODE=0 opts out; =1 forces it on.
+	//
+	// History: (1) TestPipelinedDecodeParityLiveModel (darwin/MLX) found
+	// pipelined output diverging from plain decode — still open on MLX, so
+	// the MLX default remains OFF until that parity passes. (2) On GGML
+	// (Termux aarch64) the pipelined loop crashed in
+	// ggml_backend_graph_compute and every generated token after the first
+	// was wrong (embedding gather read garbage ids). Root-caused 2026-09:
+	// ggml_argmax yields an I32 tensor, but AsType/reads treated the
+	// sampled id as I64 (and the CPU dup kernel can't cast I32/I64 at all),
+	// so the next step's embedding gather consumed garbage ids. Fixed in
+	// tensor/ggml AsType/Int64Data: I32→I64 widens in Go with an explicit
+	// Eval of the argmax first; gated by
+	// TestPipelinedDecodeParityLiveModelGGML.
+	usePipelined := useGPUArgmax && !useMTP && pipelinedOK && genCfg.MaxTokens > 1
+	if v := os.Getenv("SINTER_PIPELINE_DECODE"); v != "" {
+		usePipelined = v == "1" // explicit override (default ON; "0" opts out)
+	}
 	// Compiled decode (CompiledGreedyArchitecture): the whole step runs as
 	// one MLX-compiled graph closure, replaying a cached execution plan
 	// instead of re-walking the ~1500-op graph per token. Opt-in via env;

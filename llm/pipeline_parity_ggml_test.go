@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/sprout-foundry/sinter/llm"
+	_ "github.com/sprout-foundry/sinter/llm/all"
 )
 
 // TestPipelinedDecodeParityLiveModelGGML mirrors the darwin parity test for
