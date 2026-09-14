@@ -3,12 +3,12 @@
 package gemma4
 
 import (
-	"math"
-	"path/filepath"
 	"encoding/binary"
-	"strings"
 	"fmt"
+	"math"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/sprout-foundry/sinter/tensor"
 )

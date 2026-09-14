@@ -41,5 +41,4 @@ func TestProbeGGMLLogits(t *testing.T) {
 	}
 	t.Logf("tokens=%v text=%q", toks, text)
 
-
 }

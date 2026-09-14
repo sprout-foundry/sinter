@@ -29,7 +29,7 @@ func TestProbeMLXRopeThetaExtract(t *testing.T) {
 		vals := make([]float32, S*D)
 		pairAt := make([]int, S)
 		for p := 0; p < S; p++ {
-			pairAt[p] = (p*2) % (D / 2)
+			pairAt[p] = (p * 2) % (D / 2)
 			vals[p*D+pairAt[p]] = 1
 		}
 		x, err := NewArrayFromFloat32(vals, []int{1, 1, S, D})

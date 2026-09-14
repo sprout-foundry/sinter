@@ -8,8 +8,8 @@ import (
 	"testing"
 
 	"github.com/sprout-foundry/sinter/llm"
-	_ "github.com/sprout-foundry/sinter/tensor/ggml"
 	"github.com/sprout-foundry/sinter/tensor"
+	_ "github.com/sprout-foundry/sinter/tensor/ggml"
 )
 
 func TestProbeQwen35GGML(t *testing.T) {

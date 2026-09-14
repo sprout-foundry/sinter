@@ -3,10 +3,10 @@
 package llm
 
 import (
-	"os"
 	"encoding/binary"
 	"fmt"
 	"math"
+	"os"
 	"runtime"
 
 	"github.com/sprout-foundry/sinter/tensor"

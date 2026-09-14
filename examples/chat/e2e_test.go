@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -73,6 +74,42 @@ func ggmlPlatform() bool {
 	return gpu || (runtime.GOOS == "android" && runtime.GOARCH == "arm64")
 }
 
+// memAvailableBytes reads MemAvailable from /proc/meminfo (Linux/Android).
+func memAvailableBytes() (uint64, bool) {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "MemAvailable:") {
+			kb, err := strconv.ParseUint(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(line, "MemAvailable:")), "kB")), 10, 64)
+			if err != nil {
+				return 0, false
+			}
+			return kb * 1024, true
+		}
+	}
+	return 0, false
+}
+
+// dirWeightsBytes sums the size of safetensors files in a model dir.
+func dirWeightsBytes(dir string) uint64 {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	var total uint64
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".safetensors") {
+			continue
+		}
+		if info, err := e.Info(); err == nil {
+			total += uint64(info.Size())
+		}
+	}
+	return total
+}
+
 func TestChatEndToEnd(t *testing.T) {
 	if runtime.GOOS != "darwin" && !ggmlPlatform() {
 		t.Skip("e2e generation requires the Metal backend (darwin/arm64) or GGML (linux)")
@@ -112,6 +149,71 @@ func TestChatEndToEnd(t *testing.T) {
 	}
 	if strings.Contains(text, "tok/s") {
 		t.Logf("%s", text[strings.LastIndex(text, "["):])
+	}
+}
+
+// TestChatAllLocalFamilies drives the example against every model found on
+// disk, so each architecture family (qwen2, llama/minicpm5, qwen3,
+// qwen3_5, gemma4, lfm2) gets an end-to-end proof wherever its weights are
+// present. Assertions are lenient — any non-empty generation — because tiny
+// models don't always echo the exact phrase; the strict echo check lives in
+// TestChatEndToEnd. Skips cleanly when no models are installed.
+func TestChatAllLocalFamilies(t *testing.T) {
+	if runtime.GOOS != "darwin" && !ggmlPlatform() {
+		t.Skip("generation requires the Metal backend (darwin/arm64) or GGML (linux)")
+	}
+	dirs := candidateModelDirs(t)
+	if len(dirs) == 0 {
+		t.Skip("no local models found; download one (see README)")
+	}
+	if pinned := os.Getenv("SINTER_E2E_MODEL"); pinned != "" {
+		// CI pins one model: the primary e2e already covers it.
+		t.Skip("SINTER_E2E_MODEL set; TestChatEndToEnd covers it")
+	}
+
+	bin, err := goBuildExample(t)
+	if err != nil {
+		t.Fatalf("build example: %v", err)
+	}
+
+	for _, dir := range dirs {
+		dir := dir
+		t.Run(filepath.Base(dir), func(t *testing.T) {
+			// Android LMK guard: the loader holds the safetensors blob plus
+			// dequantized weights, so peak RSS is ~2x weights + KV + graph.
+			// Observed on this device: 1.4 GB weights at 4.5 GB free = ok,
+			// 2.3 GB weights at ~4.5 GB free = LMK kills the process. Skip
+			// anything above 40% of currently-available memory.
+			if avail, ok := memAvailableBytes(); ok {
+				w := dirWeightsBytes(dir)
+				if w > 0 && w*10 > avail*4 {
+					t.Skipf("weights (%d MB) > 40%% of MemAvailable (%d MB): LMK risk on this device",
+						w>>20, avail>>20)
+				}
+			}
+			args := []string{"-model", dir, "-prompt", "Say exactly: hello world", "-max-tokens", "40", "-timeout", "4m"}
+			if isThinkingModel(dir) {
+				args = append(args, "-thinking")
+			}
+			out, err := exec.Command(bin, args...).CombinedOutput()
+			if err != nil {
+				t.Fatalf("sinter-chat: %v\n%s", err, out)
+			}
+			text := string(out)
+			// Generated text is everything before the trailing [load ...]
+			// stats line (stderr), so strip it before the emptiness check —
+			// a zero-token run still prints stats and must fail here.
+			gen := text
+			if i := strings.LastIndex(text, "[load"); i >= 0 {
+				gen = text[:i]
+				t.Logf("%s", text[i:])
+			} else {
+				t.Logf("output (no stats line): %q", text)
+			}
+			if strings.TrimSpace(gen) == "" {
+				t.Fatalf("no output generated (stats: %q)", text)
+			}
+		})
 	}
 }
 

@@ -51,6 +51,7 @@ type hfConfig struct {
 	NormTopkProb          bool `json:"norm_topk_prob"`
 
 	LayerTypes     []string    `json:"layer_types"`
+	FullAttnIdxs   []int       `json:"full_attn_idxs"`
 	RopeParameters *ropeParams `json:"rope_parameters"`
 
 	// Gemma4 fields
@@ -282,8 +283,19 @@ func LoadConfig(path string) (ModelConfig, error) {
 		}
 	case "lfm2":
 		cfg.WeightPrefix = "model."
-		if len(cfg.LayerTypes) > 0 && cfg.NumLayers > 0 {
-			// LayerTypes already loaded from config; no override needed
+		// Liquid's config dialect declares the conv/attention mix via
+		// full_attn_idxs (indices of full-attention layers); everything else
+		// is a short-conv layer. Translate to layer_types for New().
+		if len(cfg.LayerTypes) == 0 && len(raw.FullAttnIdxs) > 0 && cfg.NumLayers > 0 {
+			cfg.LayerTypes = make([]string, cfg.NumLayers)
+			for i := range cfg.LayerTypes {
+				cfg.LayerTypes[i] = "sliding_attention" // conv layer, in lfm2 terms
+			}
+			for _, idx := range raw.FullAttnIdxs {
+				if idx >= 0 && idx < cfg.NumLayers {
+					cfg.LayerTypes[idx] = "full_attention"
+				}
+			}
 		}
 	default:
 		cfg.WeightPrefix = "model."
