@@ -20,12 +20,16 @@
 // The C signatures below are copied from the upstream mlx-c headers
 // (array.h, ops.h, stream.h, device.h, vector.h) and must stay byte-for-byte
 // aligned with them — any drift silently corrupts the ABI.
+//
+// No build-time dependency on the MLX C library: the headers are vendored
+// under mlxc_headers/ (mlx-c v0.6.0, MIT) and libmlxc is dlopen'd at runtime
+// by mlx_shim.c (see that file for the candidate paths). The package builds
+// and the binary runs without the mlx-c Homebrew formula; Available() is
+// false when the library is absent.
 package mlx
 
 /*
-#cgo CFLAGS: -DMLX_C_BINDINGS
-#cgo CFLAGS: -I/opt/homebrew/include
-#cgo LDFLAGS: -L/opt/homebrew/lib -lmlx -lmlxc
+#cgo CFLAGS: -Imlxc_headers
 
 #include <mlx/c/array.h>
 #include <mlx/c/compile.h>

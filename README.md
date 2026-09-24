@@ -48,12 +48,13 @@ Model catalog with RAM tiers and auto-selection lives in `llm/catalog`
 | `SINTER_LOCAL_DEBUG` / `SINTER_GEN_MEM` | Engine + generation memory debug logging |
 | `SINTER_COMPILED_DECODE`, `SINTER_MTP_*` | Experimental decode-path opt-ins (parity-tested, MLX only) |
 | `SINTER_GGML_BATCH=0` | Disable GGML batched eval (on by default; restores eager per-op eval) |
+| `MLX_C_LIB` | Path to `libmlxc.dylib` for the MLX backend. Default: `<exe>/lib/`, then `/opt/homebrew/opt/mlx-c/lib/` (`brew install mlx-c`). MLX is optional — without it the binary runs and `mlx.Available()` is false |
 
 ## Development
 
 ```bash
 go build -tags ggml ./...   # GGML platforms (Linux, Termux/Android): needs libggml + libggml-base
-go build ./...              # macOS (Apple Silicon): needs mlx-c (brew); stubs compile elsewhere
+go build ./...              # macOS (Apple Silicon): MLX is dlopen'd at runtime (optional); stubs elsewhere
 go test -tags ggml ./...    # or plain `go test ./...` on macOS
 ```
 
