@@ -68,6 +68,10 @@ mlx_array mlx_array_new_data(const void* data, const int* shape, int dim, mlx_dt
   if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return (mlx_array){0}; }
   return mlx_dispatch.mlx_array_new_data(data, shape, dim, dtype);
 }
+mlx_array mlx_array_new_float(float val) {
+  if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return (mlx_array){0}; }
+  return mlx_dispatch.mlx_array_new_float(val);
+}
 mlx_array mlx_array_new_int(int val) {
   if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return (mlx_array){0}; }
   return mlx_dispatch.mlx_array_new_int(val);

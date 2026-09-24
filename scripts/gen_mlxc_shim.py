@@ -81,8 +81,9 @@ def collect_go_names() -> set:
 
 def collect_c_names() -> set:
     names = set()
-    for f in PKG.glob("*.c"):
-        if "dispatch_gen" in f.name:
+    files = list(PKG.glob("*.c")) + list(PKG.glob("*.go"))
+    for f in files:
+        if "dispatch_gen" in f.name or "resolve_gen" in f.name:
             continue
         for m in re.finditer(r"\bmlx_[a-z_0-9_]+\s*\(", f.read_text()):
             n = m.group(0)[:-1].strip()

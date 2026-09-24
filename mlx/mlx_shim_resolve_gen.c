@@ -39,6 +39,8 @@ int mlx_shim_resolve_dispatch(void* handle, mlx_shim_dispatch_t* d) {
   if (!p) return 0; d->mlx_array_new = (mlx_array (*)(void))p;
   p = dlsym(handle, "mlx_array_new_data");
   if (!p) return 0; d->mlx_array_new_data = (mlx_array (*)(const void* data, const int* shape, int dim, mlx_dtype dtype))p;
+  p = dlsym(handle, "mlx_array_new_float");
+  if (!p) return 0; d->mlx_array_new_float = (mlx_array (*)(float val))p;
   p = dlsym(handle, "mlx_array_new_int");
   if (!p) return 0; d->mlx_array_new_int = (mlx_array (*)(int val))p;
   p = dlsym(handle, "mlx_array_set");
