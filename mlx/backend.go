@@ -312,6 +312,12 @@ func (b *MetalBackend) Conv1D(input, weight tensor.Array, stride, padding, dilat
 	return Conv1D(input.(*Array), weight.(*Array), stride, padding, dilation, groups, toStream(s))
 }
 
+// Conv2D applies a 2D convolution: input [B, H, W, C_in] (NHWC), weight
+// [C_out, kH, kW, C_in/groups].
+func (b *MetalBackend) Conv2D(input, weight tensor.Array, stride, padding, dilation, groups int, s tensor.Stream) (tensor.Array, error) {
+	return Conv2D(input.(*Array), weight.(*Array), stride, padding, dilation, groups, toStream(s))
+}
+
 func (b *MetalBackend) Quantize(w tensor.Array, groupSize, bits int, mode string, s tensor.Stream) ([]tensor.Array, error) {
 	results, err := Quantize(w.(*Array), groupSize, bits, mode, toStream(s))
 	if err != nil {

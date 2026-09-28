@@ -186,6 +186,10 @@ type Backend interface {
 
 	// Convolution
 	Conv1D(input, weight Array, stride, padding, dilation, groups int, s Stream) (Array, error)
+	// Conv2D applies a 2D convolution: input [B, H, W, C_in] (NHWC), weight
+	// [C_out, kH, kW, C_in/groups]. stride/padding/dilation apply to both
+	// spatial axes.
+	Conv2D(input, weight Array, stride, padding, dilation, groups int, s Stream) (Array, error)
 
 	// Quantization
 	Quantize(w Array, groupSize, bits int, mode string, s Stream) ([]Array, error)

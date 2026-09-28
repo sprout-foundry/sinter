@@ -163,6 +163,11 @@ func Conv1D(input, weight *Array, stride, padding, dilation, groups int, s *Stre
 	return nil, errUnavailable
 }
 
+// Conv2D returns errUnavailable on stub builds.
+func Conv2D(input, weight *Array, stride, padding, dilation, groups int, s *Stream) (*Array, error) {
+	return nil, errUnavailable
+}
+
 // Sqrt returns errUnavailable on stub builds.
 func Sqrt(a *Array, s *Stream) (*Array, error)     { return nil, errUnavailable }
 func Rsqrt(a *Array, s *Stream) (*Array, error)    { return nil, errUnavailable }

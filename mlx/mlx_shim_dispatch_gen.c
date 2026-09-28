@@ -124,6 +124,10 @@ int mlx_conv1d(mlx_array* res, const mlx_array input, const mlx_array weight, in
   if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return 1; }
   return mlx_dispatch.mlx_conv1d(res, input, weight, stride, padding, dilation, groups, s);
 }
+int mlx_conv2d(mlx_array* res, const mlx_array input, const mlx_array weight, int stride_0, int stride_1, int padding_0, int padding_1, int dilation_0, int dilation_1, int groups, const mlx_stream s) {
+  if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return 1; }
+  return mlx_dispatch.mlx_conv2d(res, input, weight, stride_0, stride_1, padding_0, padding_1, dilation_0, dilation_1, groups, s);
+}
 int mlx_cos(mlx_array* res, const mlx_array a, const mlx_stream s) {
   if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return 1; }
   return mlx_dispatch.mlx_cos(res, a, s);

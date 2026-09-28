@@ -3731,6 +3731,12 @@ func (g *GGMLBackend) readDataAsFloat32(a *Array) ([]float32, error) {
 	}
 }
 
+// Conv2D is not implemented on GGML (image-diffusion models are Metal/MLX
+// only today). Fails loudly rather than silently degrading.
+func (g *GGMLBackend) Conv2D(input, weight tensor.Array, stride, padding, dilation, groups int, s tensor.Stream) (tensor.Array, error) {
+	return nil, fmt.Errorf("ggml: Conv2D not implemented")
+}
+
 // ── tensor.Backend: quantization ───────────────────────────────────
 
 func (g *GGMLBackend) Quantize(w tensor.Array, groupSize, bits int, mode string, s tensor.Stream) ([]tensor.Array, error) {

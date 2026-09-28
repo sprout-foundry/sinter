@@ -67,6 +67,8 @@ int mlx_shim_resolve_dispatch(void* handle, mlx_shim_dispatch_t* d) {
   if (!p) return 0; d->mlx_concatenate_axis = (int (*)(mlx_array* res, const mlx_vector_array arrays, int axis, const mlx_stream s))p;
   p = dlsym(handle, "mlx_conv1d");
   if (!p) return 0; d->mlx_conv1d = (int (*)(mlx_array* res, const mlx_array input, const mlx_array weight, int stride, int padding, int dilation, int groups, const mlx_stream s))p;
+  p = dlsym(handle, "mlx_conv2d");
+  if (!p) return 0; d->mlx_conv2d = (int (*)(mlx_array* res, const mlx_array input, const mlx_array weight, int stride_0, int stride_1, int padding_0, int padding_1, int dilation_0, int dilation_1, int groups, const mlx_stream s))p;
   p = dlsym(handle, "mlx_cos");
   if (!p) return 0; d->mlx_cos = (int (*)(mlx_array* res, const mlx_array a, const mlx_stream s))p;
   p = dlsym(handle, "mlx_default_gpu_stream_new");
