@@ -3773,6 +3773,13 @@ func (g *GGMLBackend) GatherQuantizedMatMul(x, w, scales, biases, lhsIndices, rh
 	return nil, fmt.Errorf("ggml: GatherQuantizedMatMul not implemented")
 }
 
+// RandomNormalKey is MLX-only for now: MLX's key->normal path is what makes
+// seeded noise bit-compatible with Python-side mlx.core.random. GGML has no
+// equivalent; image-gen only runs on the Metal backend.
+func (g *GGMLBackend) RandomNormalKey(shape []int, seed uint64, s tensor.Stream) (tensor.Array, error) {
+	return nil, fmt.Errorf("ggml: RandomNormalKey not implemented")
+}
+
 // ── tensor.Backend: memory management ──────────────────────────────
 
 func (g *GGMLBackend) SetCacheLimit(bytes uint64) error  { return nil }
