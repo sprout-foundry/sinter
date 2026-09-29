@@ -326,6 +326,14 @@ int mlx_quantized_matmul(mlx_array* res, const mlx_array x, const mlx_array w, c
   if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return 1; }
   return mlx_dispatch.mlx_quantized_matmul(res, x, w, scales, biases, transpose, group_size, bits, mode, s);
 }
+int mlx_random_key(mlx_array* res, uint64_t seed) {
+  if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return 1; }
+  return mlx_dispatch.mlx_random_key(res, seed);
+}
+int mlx_random_normal(mlx_array* res, const int* shape, size_t shape_num, mlx_dtype dtype, float loc, float scale, const mlx_array key , const mlx_stream s) {
+  if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return 1; }
+  return mlx_dispatch.mlx_random_normal(res, shape, shape_num, dtype, loc, scale, key, s);
+}
 int mlx_repeat_axis(mlx_array* res, const mlx_array arr, int repeats, int axis, const mlx_stream s) {
   if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return 1; }
   return mlx_dispatch.mlx_repeat_axis(res, arr, repeats, axis, s);

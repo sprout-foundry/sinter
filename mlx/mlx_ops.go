@@ -8,6 +8,7 @@ package mlx
 #include <mlx/c/ops.h>
 #include <mlx/c/fast.h>
 #include <mlx/c/optional.h>
+#include <mlx/c/random.h>
 #include <mlx/c/stream.h>
 #include <mlx/c/vector.h>
 */
@@ -276,6 +277,26 @@ func Zeros(shape []int, dtype Dtype, s *Stream) (*Array, error) {
 	shapePtr, _ := cIntPtrs(shape)
 	rc := C.mlx_zeros(&out, shapePtr, C.size_t(len(shape)), C.mlx_dtype(dtype), s.cHandle())
 	return wrapResult(out, rc, "zeros")
+}
+
+// RandomKey derives a PRNG key array from a seed (mlx_random_key).
+func RandomKey(seed uint64) (*Array, error) {
+	out := newOutput()
+	rc := C.mlx_random_key(&out, C.uint64_t(seed))
+	return wrapResult(out, rc, "random_key")
+}
+
+// RandomNormal fills shape with N(loc, scale) samples. key may be nil, in
+// which case the global PRNG state is consumed (matching mx.random.normal).
+func RandomNormal(shape []int, dtype Dtype, loc, scale float32, key *Array, s *Stream) (*Array, error) {
+	out := newOutput()
+	shapePtr, _ := cIntPtrs(shape)
+	var keyH C.mlx_array
+	if key != nil {
+		keyH = key.cHandle()
+	}
+	rc := C.mlx_random_normal(&out, shapePtr, C.size_t(len(shape)), C.mlx_dtype(dtype), C.float(loc), C.float(scale), keyH, s.cHandle())
+	return wrapResult(out, rc, "random_normal")
 }
 
 // SliceUpdate writes update into src at the region [start, stop) and returns

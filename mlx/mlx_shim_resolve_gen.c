@@ -169,6 +169,10 @@ int mlx_shim_resolve_dispatch(void* handle, mlx_shim_dispatch_t* d) {
   if (!p) return 0; d->mlx_quantize = (int (*)(mlx_vector_array* res, const mlx_array w, mlx_optional_int group_size, mlx_optional_int bits, const char* mode, const mlx_array global_scale , const mlx_stream s))p;
   p = dlsym(handle, "mlx_quantized_matmul");
   if (!p) return 0; d->mlx_quantized_matmul = (int (*)(mlx_array* res, const mlx_array x, const mlx_array w, const mlx_array scales, const mlx_array biases , bool transpose, mlx_optional_int group_size, mlx_optional_int bits, const char* mode, const mlx_stream s))p;
+  p = dlsym(handle, "mlx_random_key");
+  if (!p) return 0; d->mlx_random_key = (int (*)(mlx_array* res, uint64_t seed))p;
+  p = dlsym(handle, "mlx_random_normal");
+  if (!p) return 0; d->mlx_random_normal = (int (*)(mlx_array* res, const int* shape, size_t shape_num, mlx_dtype dtype, float loc, float scale, const mlx_array key , const mlx_stream s))p;
   p = dlsym(handle, "mlx_repeat_axis");
   if (!p) return 0; d->mlx_repeat_axis = (int (*)(mlx_array* res, const mlx_array arr, int repeats, int axis, const mlx_stream s))p;
   p = dlsym(handle, "mlx_reset_peak_memory");

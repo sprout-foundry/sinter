@@ -348,6 +348,12 @@ func Dequantize(*Array, *Array, *Array, int, int, string, *Stream) (*Array, erro
 func QuantizedMatMul(*Array, *Array, *Array, *Array, bool, int, int, string, *Stream) (*Array, error) {
 	return nil, errUnavailable
 }
+func RandomKey(uint64) (*Array, error) {
+	return nil, errUnavailable
+}
+func RandomNormal([]int, Dtype, float32, float32, *Array, *Stream) (*Array, error) {
+	return nil, errUnavailable
+}
 func GatherQuantizedMatMul(*Array, *Array, *Array, *Array, *Array, *Array, bool, int, int, string, bool, *Stream) (*Array, error) {
 	return nil, errUnavailable
 }

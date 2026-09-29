@@ -197,6 +197,10 @@ type Backend interface {
 	GatherQuantizedMatMul(x, w, scales, biases, lhsIndices, rhsIndices Array, transpose bool, groupSize, bits int, mode string, sortedIndices bool, s Stream) (Array, error)
 	Dequantize(w, scales, biases Array, groupSize, bits int, mode string, s Stream) (Array, error)
 
+	// RandomNormalKey fills shape with standard-normal samples derived from
+	// the seed — bit-identical to mx.random.normal(key=mx.random.key(seed)).
+	RandomNormalKey(shape []int, seed uint64, s Stream) (Array, error)
+
 	// Memory management
 	SetCacheLimit(bytes uint64) error
 	SetMemoryLimit(bytes uint64) error

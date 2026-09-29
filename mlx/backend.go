@@ -338,6 +338,17 @@ func (b *MetalBackend) QuantizedMatMul(x, w, scales tensor.Array, biases tensor.
 	return QuantizedMatMul(x.(*Array), w.(*Array), scales.(*Array), bs, transpose, groupSize, bits, mode, toStream(s))
 }
 
+// RandomNormalKey fills shape with standard-normal samples derived from the
+// given seed — bit-identical to mx.random.normal(key=mx.random.key(seed)).
+func (b *MetalBackend) RandomNormalKey(shape []int, seed uint64, s tensor.Stream) (tensor.Array, error) {
+	key, err := RandomKey(seed)
+	if err != nil {
+		return nil, err
+	}
+	defer key.Free()
+	return RandomNormal(shape, Float32, 0, 1, key, toStream(s))
+}
+
 func (b *MetalBackend) GatherQuantizedMatMul(x, w, scales, biases, lhsIndices, rhsIndices tensor.Array, transpose bool, groupSize, bits int, mode string, sortedIndices bool, s tensor.Stream) (tensor.Array, error) {
 	var bs *Array
 	if biases != nil {
