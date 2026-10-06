@@ -186,12 +186,20 @@ type Backend interface {
 
 	// Convolution
 	Conv1D(input, weight Array, stride, padding, dilation, groups int, s Stream) (Array, error)
+	// Conv2D applies a 2D convolution: input [B, H, W, C_in] (NHWC), weight
+	// [C_out, kH, kW, C_in/groups]. stride/padding/dilation apply to both
+	// spatial axes.
+	Conv2D(input, weight Array, stride, padding, dilation, groups int, s Stream) (Array, error)
 
 	// Quantization
 	Quantize(w Array, groupSize, bits int, mode string, s Stream) ([]Array, error)
 	QuantizedMatMul(x, w, scales Array, biases Array, transpose bool, groupSize, bits int, mode string, s Stream) (Array, error)
 	GatherQuantizedMatMul(x, w, scales, biases, lhsIndices, rhsIndices Array, transpose bool, groupSize, bits int, mode string, sortedIndices bool, s Stream) (Array, error)
 	Dequantize(w, scales, biases Array, groupSize, bits int, mode string, s Stream) (Array, error)
+
+	// RandomNormalKey fills shape with standard-normal samples derived from
+	// the seed — bit-identical to mx.random.normal(key=mx.random.key(seed)).
+	RandomNormalKey(shape []int, seed uint64, s Stream) (Array, error)
 
 	// Memory management
 	SetCacheLimit(bytes uint64) error

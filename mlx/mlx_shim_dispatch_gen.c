@@ -124,6 +124,10 @@ int mlx_conv1d(mlx_array* res, const mlx_array input, const mlx_array weight, in
   if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return 1; }
   return mlx_dispatch.mlx_conv1d(res, input, weight, stride, padding, dilation, groups, s);
 }
+int mlx_conv2d(mlx_array* res, const mlx_array input, const mlx_array weight, int stride_0, int stride_1, int padding_0, int padding_1, int dilation_0, int dilation_1, int groups, const mlx_stream s) {
+  if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return 1; }
+  return mlx_dispatch.mlx_conv2d(res, input, weight, stride_0, stride_1, padding_0, padding_1, dilation_0, dilation_1, groups, s);
+}
 int mlx_cos(mlx_array* res, const mlx_array a, const mlx_stream s) {
   if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return 1; }
   return mlx_dispatch.mlx_cos(res, a, s);
@@ -321,6 +325,14 @@ int mlx_quantize(mlx_vector_array* res, const mlx_array w, mlx_optional_int grou
 int mlx_quantized_matmul(mlx_array* res, const mlx_array x, const mlx_array w, const mlx_array scales, const mlx_array biases , bool transpose, mlx_optional_int group_size, mlx_optional_int bits, const char* mode, const mlx_stream s) {
   if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return 1; }
   return mlx_dispatch.mlx_quantized_matmul(res, x, w, scales, biases, transpose, group_size, bits, mode, s);
+}
+int mlx_random_key(mlx_array* res, uint64_t seed) {
+  if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return 1; }
+  return mlx_dispatch.mlx_random_key(res, seed);
+}
+int mlx_random_normal(mlx_array* res, const int* shape, size_t shape_num, mlx_dtype dtype, float loc, float scale, const mlx_array key , const mlx_stream s) {
+  if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return 1; }
+  return mlx_dispatch.mlx_random_normal(res, shape, shape_num, dtype, loc, scale, key, s);
 }
 int mlx_repeat_axis(mlx_array* res, const mlx_array arr, int repeats, int axis, const mlx_stream s) {
   if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return 1; }

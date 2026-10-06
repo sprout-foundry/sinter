@@ -189,6 +189,9 @@ func (b *stubBackend) GatherQuantizedMatMul(tensor.Array, tensor.Array, tensor.A
 func (b *stubBackend) Dequantize(tensor.Array, tensor.Array, tensor.Array, int, int, string, tensor.Stream) (tensor.Array, error) {
 	return nil, errUnavailable
 }
+func (b *stubBackend) RandomNormalKey([]int, uint64, tensor.Stream) (tensor.Array, error) {
+	return nil, errUnavailable
+}
 func (b *stubBackend) SetCacheLimit(uint64) error                 { return errUnavailable }
 func (b *stubBackend) SetMemoryLimit(uint64) error                { return errUnavailable }
 func (b *stubBackend) ClearCache() error                          { return errUnavailable }

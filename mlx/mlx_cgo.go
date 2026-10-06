@@ -419,17 +419,18 @@ func AsyncEvalBatch(arrays []*Array) error {
 // RawBytes returns the raw underlying bytes of the array. Evaluates first.
 // The bytes are copied so the caller owns the memory.
 func (a *Array) RawBytes() ([]byte, error) {
-	if err := a.Eval(); err != nil {
+	flat, n, err := contiguousFlat(a)
+	if err != nil {
 		return nil, err
 	}
-	n := int(C.mlx_array_size(a.cHandle()))
 	if n == 0 {
 		return []byte{}, nil
 	}
+	defer C.mlx_array_free(flat)
 	dt := a.Dtype()
 	elemSize := dtypeByteSize(dt)
 	totalBytes := n * elemSize
-	ptr := C.mlx_array_data_uint8(a.cHandle())
+	ptr := C.mlx_array_data_uint8(flat)
 	if ptr == nil {
 		return nil, errors.New("mlx: data pointer is null (eval failed?)")
 	}
@@ -454,19 +455,48 @@ func dtypeByteSize(dt Dtype) int {
 	}
 }
 
+// contiguousFlat reshapes a to [n] (n = size) and evaluates it, returning the
+// flat array. mlx_array_data_* expose the underlying buffer, which matches the
+// logical shape order only for contiguous arrays; a lazy transpose/slice is a
+// strided view and would read back in the OLD layout. Reshaping forces a
+// contiguous copy in logical order first. The caller must C.mlx_array_free
+// the result (it owns one handle).
+func contiguousFlat(a *Array) (C.mlx_array, int, error) {
+	n := int(C.mlx_array_size(a.cHandle()))
+	if n == 0 {
+		return C.mlx_array{}, 0, nil
+	}
+	flatShape := []C.int{C.int(n)}
+	var flat C.mlx_array
+	if rc := C.mlx_reshape(&flat, a.cHandle(), &flatShape[0], 1, C.mlx_default_gpu_stream_new()); rc != 0 {
+		C.mlx_array_free(flat)
+		return C.mlx_array{}, 0, errors.New("mlx: flat reshape failed")
+	}
+	w := wrap(flat)
+	if err := w.Eval(); err != nil {
+		C.mlx_array_free(flat)
+		return C.mlx_array{}, 0, err
+	}
+	// w wraps the same handle; neutralize its finalizer so the single handle
+	// is freed exactly once by the caller's mlx_array_free.
+	runtime.SetFinalizer(w, nil)
+	return flat, n, nil
+}
+
 // Float32Data returns the array's data as a float32 slice. It evaluates the
 func (a *Array) Float32Data() ([]float32, error) {
 	if got := a.Dtype(); got != Float32 {
 		return nil, fmt.Errorf("mlx: Float32Data on %v array", got)
 	}
-	if err := a.Eval(); err != nil {
+	flat, n, err := contiguousFlat(a)
+	if err != nil {
 		return nil, err
 	}
-	n := int(C.mlx_array_size(a.cHandle()))
 	if n == 0 {
 		return []float32{}, nil
 	}
-	ptr := C.mlx_array_data_float32(a.cHandle())
+	defer C.mlx_array_free(flat)
+	ptr := C.mlx_array_data_float32(flat)
 	if ptr == nil {
 		return nil, errors.New("mlx: data pointer is null (eval failed?)")
 	}
@@ -485,14 +515,15 @@ func (a *Array) Int64Data() ([]int64, error) {
 	if got := a.Dtype(); got != Int64 {
 		return nil, fmt.Errorf("mlx: Int64Data on %v array", got)
 	}
-	if err := a.Eval(); err != nil {
+	flat, n, err := contiguousFlat(a)
+	if err != nil {
 		return nil, err
 	}
-	n := int(C.mlx_array_size(a.cHandle()))
 	if n == 0 {
 		return []int64{}, nil
 	}
-	ptr := C.mlx_array_data_int64(a.cHandle())
+	defer C.mlx_array_free(flat)
+	ptr := C.mlx_array_data_int64(flat)
 	if ptr == nil {
 		return nil, errors.New("mlx: data pointer is null (eval failed?)")
 	}
@@ -508,14 +539,15 @@ func (a *Array) Uint32Data() ([]uint32, error) {
 	if got := a.Dtype(); got != UInt32 {
 		return nil, fmt.Errorf("mlx: Uint32Data on %v array", got)
 	}
-	if err := a.Eval(); err != nil {
+	flat, n, err := contiguousFlat(a)
+	if err != nil {
 		return nil, err
 	}
-	n := int(C.mlx_array_size(a.cHandle()))
 	if n == 0 {
 		return []uint32{}, nil
 	}
-	ptr := C.mlx_array_data_uint32(a.cHandle())
+	defer C.mlx_array_free(flat)
+	ptr := C.mlx_array_data_uint32(flat)
 	if ptr == nil {
 		return nil, errors.New("mlx: data pointer is null (eval failed?)")
 	}

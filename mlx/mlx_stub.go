@@ -163,6 +163,11 @@ func Conv1D(input, weight *Array, stride, padding, dilation, groups int, s *Stre
 	return nil, errUnavailable
 }
 
+// Conv2D returns errUnavailable on stub builds.
+func Conv2D(input, weight *Array, stride, padding, dilation, groups int, s *Stream) (*Array, error) {
+	return nil, errUnavailable
+}
+
 // Sqrt returns errUnavailable on stub builds.
 func Sqrt(a *Array, s *Stream) (*Array, error)     { return nil, errUnavailable }
 func Rsqrt(a *Array, s *Stream) (*Array, error)    { return nil, errUnavailable }
@@ -341,6 +346,12 @@ func Dequantize(*Array, *Array, *Array, int, int, string, *Stream) (*Array, erro
 	return nil, errUnavailable
 }
 func QuantizedMatMul(*Array, *Array, *Array, *Array, bool, int, int, string, *Stream) (*Array, error) {
+	return nil, errUnavailable
+}
+func RandomKey(uint64) (*Array, error) {
+	return nil, errUnavailable
+}
+func RandomNormal([]int, Dtype, float32, float32, *Array, *Stream) (*Array, error) {
 	return nil, errUnavailable
 }
 func GatherQuantizedMatMul(*Array, *Array, *Array, *Array, *Array, *Array, bool, int, int, string, bool, *Stream) (*Array, error) {

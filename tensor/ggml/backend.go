@@ -3731,6 +3731,12 @@ func (g *GGMLBackend) readDataAsFloat32(a *Array) ([]float32, error) {
 	}
 }
 
+// Conv2D is not implemented on GGML (image-diffusion models are Metal/MLX
+// only today). Fails loudly rather than silently degrading.
+func (g *GGMLBackend) Conv2D(input, weight tensor.Array, stride, padding, dilation, groups int, s tensor.Stream) (tensor.Array, error) {
+	return nil, fmt.Errorf("ggml: Conv2D not implemented")
+}
+
 // ── tensor.Backend: quantization ───────────────────────────────────
 
 func (g *GGMLBackend) Quantize(w tensor.Array, groupSize, bits int, mode string, s tensor.Stream) ([]tensor.Array, error) {
@@ -3765,6 +3771,13 @@ func (g *GGMLBackend) Dequantize(w, scales, biases tensor.Array, groupSize, bits
 func (g *GGMLBackend) GatherQuantizedMatMul(x, w, scales, biases, lhsIndices, rhsIndices tensor.Array, transpose bool, groupSize, bits int, mode string, sortedIndices bool, s tensor.Stream) (tensor.Array, error) {
 	// Not used by the small-model path; stubbed.
 	return nil, fmt.Errorf("ggml: GatherQuantizedMatMul not implemented")
+}
+
+// RandomNormalKey is MLX-only for now: MLX's key->normal path is what makes
+// seeded noise bit-compatible with Python-side mlx.core.random. GGML has no
+// equivalent; image-gen only runs on the Metal backend.
+func (g *GGMLBackend) RandomNormalKey(shape []int, seed uint64, s tensor.Stream) (tensor.Array, error) {
+	return nil, fmt.Errorf("ggml: RandomNormalKey not implemented")
 }
 
 // ── tensor.Backend: memory management ──────────────────────────────
