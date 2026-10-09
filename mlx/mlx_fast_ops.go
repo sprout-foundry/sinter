@@ -114,7 +114,9 @@ func FastScaledDotProductAttention(q, k, v *Array, scale float32, maskMode strin
 	if sinks != nil {
 		snk = sinks.cHandle()
 	}
-	rc := C.mlx_fast_scaled_dot_product_attention(&out, q.cHandle(), k.cHandle(), v.cHandle(), C.float(scale), mode, m, snk, s.cHandle())
+	// mlx-c 0.7.0 added a `bool force_fused` parameter just before the stream.
+	// Pass false: let MLX pick the implementation, as pre-0.7.0 mlx-c did.
+	rc := C.mlx_fast_scaled_dot_product_attention(&out, q.cHandle(), k.cHandle(), v.cHandle(), C.float(scale), mode, m, snk, C.bool(false), s.cHandle())
 	return wrapResult(out, rc, "fast_sdpa")
 }
 

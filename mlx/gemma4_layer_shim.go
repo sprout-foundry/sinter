@@ -200,7 +200,7 @@ static int gemma4_shim_kv_layer(
     // --- SDPA ---
     const char* mask_mode = (seq_len > 1) ? "causal" : "";
     mlx_array ctx = {0};
-    if (mlx_fast_scaled_dot_product_attention(&ctx, qRot, kForAttn, vForAttn, 1.0f, mask_mode, MLX_NULL, MLX_NULL, s))
+    if (mlx_fast_scaled_dot_product_attention(&ctx, qRot, kForAttn, vForAttn, 1.0f, mask_mode, MLX_NULL, MLX_NULL, false, s))
         return -1;
 
     // --- Output projection ---
@@ -332,7 +332,7 @@ static int gemma4_shim_shared_kv_layer(
     // --- SDPA with shared K/V ---
     const char* mask_mode = (seq_len > 1) ? "causal" : "";
     mlx_array ctx = {0};
-    if (mlx_fast_scaled_dot_product_attention(&ctx, qRot, k_for_attn, v_for_attn, 1.0f, mask_mode, MLX_NULL, MLX_NULL, s))
+    if (mlx_fast_scaled_dot_product_attention(&ctx, qRot, k_for_attn, v_for_attn, 1.0f, mask_mode, MLX_NULL, MLX_NULL, false, s))
         return -1;
 
     // --- Output projection ---
