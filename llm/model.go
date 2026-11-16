@@ -695,10 +695,10 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 	//
 	// Image prompts never take the delta path: a delta prefill has no
 	// per-token position tables, and the positions a prompt containing
-	// images needs cannot be derived from a start offset alone. They still
-	// store a slot, so a repeated identical prompt is a cache hit for the
-	// DeltaNet state and the vision tower output — just not a delta prefill.
+	// images needs cannot be derived from a start offset alone. They take
+	// the exact-hit path below instead, which needs no positions at all.
 	prefillStart := time.Now()
+	skippedPrefill := false
 	usedDelta := shared >= minPrefixReuse && slotIdx >= 0 && shared < len(tokenIDs) && len(parts) == 0
 	if usedDelta {
 		slotCache, err := m.ensureSlotResident(slotIdx)
@@ -713,20 +713,20 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 		if err != nil {
 			return fmt.Errorf("delta prefill: %w", err)
 		}
-	} else if len(parts) > 0 && slotIdx >= 0 && shared == len(tokenIDs) {
-		// Exact image-prompt hit. A DeltaNet layer's recurrent state cannot be
-		// rewound to re-derive the last position's logits, so this used to
-		// re-run the whole prefill. The slot carries that position's hidden
-		// state instead, which is all the logits need: restore the cache, then
-		// run the final norm and vocabulary head.
+	} else if slotIdx >= 0 && shared == len(tokenIDs) {
+		// Exact prompt hit: the slot's tokens are the whole request. This is
+		// the text prompt that matches a slot exactly, and the image prompt
+		// whose images were seen before.
+		//
+		// A DeltaNet layer's recurrent state cannot be rewound to re-derive
+		// the last position's logits, so this used to re-run the whole
+		// prefill. The slot carries that position's hidden state instead,
+		// which is all the logits need: restore the cache, then run the
+		// final norm and vocabulary head.
 		//
 		// A slot without a hidden state (written by an older build, or by an
 		// architecture that does not record one) falls through to a full
 		// prefill.
-		mm, ok := m.arch.(MultimodalArchitecture)
-		if !ok {
-			return fmt.Errorf("llm: model %q does not support image input", m.cfg.Arch)
-		}
 		m.prefixSlots[slotIdx].lastUsed = m.prefixSeq
 		ch, canSkip := m.arch.(CachedHiddenArchitecture)
 		var slotCache *KVCache
@@ -740,15 +740,23 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 			if err := cache.RestorePrefix(slotCache); err != nil {
 				return fmt.Errorf("restore prefix: %w", err)
 			}
-			// SetPositionDelta still has to run: the generated tokens after
-			// this prompt are placed by 3-D position, not token index.
+			// The position delta has to be restored too: after an image
+			// prompt the generated tokens are placed by 3-D position, not
+			// token index. Zero for text prompts.
 			m.posDelta = m.prefixSlots[slotIdx].posDelta
-			mm.SetPositionDelta(m.posDelta)
+			if mm, ok := m.arch.(MultimodalArchitecture); ok {
+				mm.SetPositionDelta(m.posDelta)
+			}
 			logits, err = ch.LogitsFromHidden(cache.LastHidden())
 			if err != nil {
 				return fmt.Errorf("logits from cached hidden: %w", err)
 			}
-		} else {
+			skippedPrefill = true
+		} else if len(parts) > 0 {
+			mm, ok := m.arch.(MultimodalArchitecture)
+			if !ok {
+				return fmt.Errorf("llm: model %q does not support image input", m.cfg.Arch)
+			}
 			var delta int
 			logits, delta, err = mm.ForwardPrefillImages(m.makeIDsArray(tokenIDs), len(tokenIDs), spans, pixels, cache)
 			if err != nil {
@@ -756,6 +764,11 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 			}
 			m.posDelta = delta
 			mm.SetPositionDelta(delta)
+		} else {
+			logits, err = m.arch.ForwardPrefill(m.makeIDsArray(tokenIDs), len(tokenIDs), cache)
+			if err != nil {
+				return fmt.Errorf("prefill: %w", err)
+			}
 		}
 	} else if len(spans) > 0 {
 		// Multimodal: no prefix-cache matching (the cache keys on token ids,
@@ -785,9 +798,9 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 		if usedDelta {
 			processed = len(tokenIDs) - shared
 			path = "delta"
-		} else if len(parts) > 0 && slotIdx >= 0 && shared == len(tokenIDs) {
+		} else if skippedPrefill {
 			processed = 1
-			path = "image-cache-hit"
+			path = "cache-hit"
 		}
 		log.Printf("llm: prefill: path=%s tokens_processed=%d elapsed=%.2fs", path, processed, time.Since(prefillStart).Seconds())
 	}
