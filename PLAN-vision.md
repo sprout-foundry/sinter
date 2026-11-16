@@ -12,10 +12,16 @@ through the HTTP server against a real model.**
 
 Known gaps, in priority order:
 
-1. **MLX is unverified.** SDPA segfaults in this environment on clean HEAD
-   too (pre-existing mlx/mlx-c mismatch), so everything ran on GGML. This is
-   the one gate that still has to be met before shipping on Apple Silicon
-   with MLX.
+1. **MLX is unverified, for a diagnosed environment reason.** The installed
+   `mlx-c` (0.7.0) and `mlx` (0.32.3) are version-skewed: the C wrapper
+   passes `force_fused=True` to scaled-dot-product attention, but the
+   libmlx it links against has no fused kernel to satisfy it, so every
+   MLX model path fails with "no fused kernel is available". Ordinary ops
+   are unaffected — matmul, softmax, LayerNorm and GELU all execute
+   correctly on Metal — so this is one kernel, not a broken backend.
+   `TestFusedAttentionAvailability` in `mlx/` reports the condition.
+   Homebrew has `mlx-c` 0.8.0 and `mlx` 0.32.4; upgrading both is the fix
+   and has not been run. Everything else was verified on GGML.
 2. **The tower is not bit-identical** to the reference. See step 2.
 3. **GGML pipelined decode crashes** on image prompts (and on text prompts —
    pre-existing). Image prompts now step aside from that path, so they are
