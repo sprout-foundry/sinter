@@ -129,8 +129,8 @@ func TestRecommendModelForRAM(t *testing.T) {
 		{24 * testGB, "qwen3.5-9b"},
 		{32 * testGB, "qwen3.5-9b"},
 		{40 * testGB, "qwen3.5-9b"},
-		{48 * testGB, "qwen3.8-27b"},
-		{128 * testGB, "qwen3.8-27b"}, // 35b-a3b is never the unwarned default
+		{48 * testGB, "qwen3.5-9b"},  // qwen3.8-27b is explicit only
+		{128 * testGB, "qwen3.5-9b"}, // so is the unwarned default never a 27b or 35b
 	}
 	for _, tc := range cases {
 		m := RecommendModelForRAM(tc.ram)
@@ -144,8 +144,9 @@ func TestRecommendModelForRAM(t *testing.T) {
 // blocked matrix requested: <8GB suggested=gemma4-e2b no stretch; 8-16GB
 // suggested=gemma4-e2b stretch=qwen3.5-4b; 16-24GB suggested=qwen3.5-4b
 // (gemma4-e2b now a safe downgrade, not blocked) stretch=qwen3.5-9b;
-// 24-32GB suggested=qwen3.5-9b no stretch; 32-48GB suggested=qwen3.5-9b
-// stretch=qwen3.8-27b; 48GB+ suggested=qwen3.8-27b stretch=qwen3.6-35b-a3b.
+// 24-32GB suggested=qwen3.5-9b no stretch; 32GB+ suggested=qwen3.5-9b
+// stretch=qwen3.8-27b and qwen3.6-35b-a3b (qwen3.8-27b is explicit only, so it
+// is never suggested).
 // Anything smaller than suggested is always a selectable (eligible)
 // downgrade, never blocked — only tiers beyond the one-up stretch are
 // genuinely blocked.
@@ -180,10 +181,10 @@ func TestTieredCatalogForRAM(t *testing.T) {
 			"minicpm5-2b": TierEligible, "gemma4-e2b": TierEligible, "qwen3.5-4b": TierEligible, "qwen3.5-9b": TierSuggested, "qwen3.8-27b": TierStretch, "qwen3.6-35b-a3b": TierStretch,
 		}},
 		{"48gb", 48 * testGB, map[string]TierStatus{
-			"minicpm5-2b": TierEligible, "gemma4-e2b": TierEligible, "qwen3.5-4b": TierEligible, "qwen3.5-9b": TierEligible, "qwen3.8-27b": TierSuggested, "qwen3.6-35b-a3b": TierStretch,
+			"minicpm5-2b": TierEligible, "gemma4-e2b": TierEligible, "qwen3.5-4b": TierEligible, "qwen3.5-9b": TierSuggested, "qwen3.8-27b": TierStretch, "qwen3.6-35b-a3b": TierStretch,
 		}},
 		{"128gb", 128 * testGB, map[string]TierStatus{
-			"minicpm5-2b": TierEligible, "gemma4-e2b": TierEligible, "qwen3.5-4b": TierEligible, "qwen3.5-9b": TierEligible, "qwen3.8-27b": TierSuggested, "qwen3.6-35b-a3b": TierStretch,
+			"minicpm5-2b": TierEligible, "gemma4-e2b": TierEligible, "qwen3.5-4b": TierEligible, "qwen3.5-9b": TierSuggested, "qwen3.8-27b": TierStretch, "qwen3.6-35b-a3b": TierStretch,
 		}},
 	}
 	for _, tc := range cases {
@@ -216,5 +217,27 @@ func TestSelectableForRAM(t *testing.T) {
 	}
 	if _, known := SelectableForRAM("not-a-real-model", 128*testGB); known {
 		t.Fatal("expected unknown model name to report known=false")
+	}
+}
+
+// TestSelectModelForRAMNeverPicksExplicitOnly: an explicit-only model is
+// never loaded unasked, not even when it is the only model installed.
+func TestSelectModelForRAMNeverPicksExplicitOnly(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "qwen3.8-27b-4bit"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if m, err := SelectModelForRAM(root, 64*testGB); err == nil {
+		t.Fatalf("picked %s; an explicit-only model must not load unasked", m.Name)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "qwen3.5-9b-4bit"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m, err := SelectModelForRAM(root, 64*testGB)
+	if err != nil || m.Name != "qwen3.5-9b" {
+		t.Fatalf("got %v, %v; want qwen3.5-9b", m, err)
+	}
+	if status, ok := SelectableForRAM("qwen3.8-27b", 64*testGB); !ok || status != TierStretch {
+		t.Fatalf("qwen3.8-27b at 64GB: %v %v; it stays selectable by name", status, ok)
 	}
 }

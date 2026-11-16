@@ -38,6 +38,11 @@ type CatalogModel struct {
 	MinRAMSelect    uint64 // minimum total RAM (bytes) at which this model is selectable at all
 	MinRAMSuggested uint64 // minimum total RAM (bytes) at which this model becomes the unwarned default
 	ServerBackend   string // "sinter" (Go native) or "mlx_lm" (Python mlx_lm.server); empty defaults to "sinter"
+	// ExplicitOnly models load only when a person names them: they are
+	// never the suggested default and RAM-based selection never picks one,
+	// not even as a fallback when nothing else is installed. They stay
+	// selectable (with the stretch warning) wherever they fit.
+	ExplicitOnly bool
 }
 
 // ModelCatalog lists downloadable models, ordered smallest to largest.
@@ -88,11 +93,14 @@ var ModelCatalog = []CatalogModel{
 		// <think>\n cue) with reasoning traces kept in history — handled
 		// by Tokenizer's marksPreserveThinking family (see
 		// formatPreserveThinkingChat). MLX community 4-bit export.
+		// Explicit only: a dense 27B reads every weight for every token,
+		// so on most Macs it is too slow to be anyone's unasked default.
 		Name:            "qwen3.8-27b",
 		Dir:             "qwen3.8-27b-4bit",
 		HFRepo:          "mlx-community/Qwen3.8-27B-4bit",
 		MinRAMSelect:    32 * gb,
-		MinRAMSuggested: 48 * gb,
+		MinRAMSuggested: math.MaxUint64,
+		ExplicitOnly:    true,
 	},
 	{
 		Name: "qwen3.6-35b-a3b",
@@ -428,6 +436,9 @@ func SelectModelForRAM(modelsRoot string, ramBytes uint64) (*CatalogModel, error
 
 	for _, i := range order {
 		m := tiered[i].Model
+		if m.ExplicitOnly {
+			continue // loads only when a person names it
+		}
 		if tuned := findTunedVariantForModel(modelsRoot, m); tuned != nil {
 			return tuned, nil
 		}
