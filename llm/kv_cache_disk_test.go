@@ -3,6 +3,7 @@
 package llm
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -53,6 +54,16 @@ func TestKVCacheDiskRoundTrip(t *testing.T) {
 	}
 	// Layer 1 stays uninitialized on purpose.
 
+	// The last position's hidden state travels with the cache: an exact
+	// prompt hit reads it back to produce logits without re-running the
+	// prompt, so a spill that dropped it would silently cost a full prefill
+	// (or worse, produce logits from a stale state).
+	hidden, err := backend.NewArrayFromFloat32([]float32{1.5, -2.25, 3.75, 0.5}, []int{1, 1, 4})
+	if err != nil {
+		t.Fatalf("new hidden array: %v", err)
+	}
+	c.SetLastHidden(hidden)
+
 	path := filepath.Join(t.TempDir(), "slot.bin")
 	if err := c.SaveToDisk(path); err != nil {
 		t.Fatalf("SaveToDisk: %v", err)
@@ -100,6 +111,38 @@ func TestKVCacheDiskRoundTrip(t *testing.T) {
 		t.Fatalf("ConvState.Float32Data: %v", err)
 	}
 	assertFloat32Equal(t, "ConvState", gotConvState, []float32{3.25, -3.25})
+
+	if loaded.LastHidden() == nil {
+		t.Fatal("hidden state did not survive the round-trip")
+	}
+	gotHidden, err := loaded.LastHidden().Float32Data()
+	if err != nil {
+		t.Fatalf("hidden Float32Data: %v", err)
+	}
+	assertFloat32Equal(t, "hidden", gotHidden, []float32{1.5, -2.25, 3.75, 0.5})
+}
+
+// TestKVCacheSpillRejectsOldVersion guards the format boundary: version 2
+// appended the hidden-state record, so a version 1 file has to be rejected
+// rather than read with the wrong layout.
+func TestKVCacheSpillRejectsOldVersion(t *testing.T) {
+	backend := tensor.DetectBackend()
+	if backend == nil || !backend.Available() {
+		t.Skip("no tensor backend available on this platform")
+	}
+	stream, err := backend.DefaultGPUStream()
+	if err != nil {
+		t.Fatalf("get stream: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "v1.bin")
+	raw := []byte{'S', 'P', 'K', 'V', 1, 0, 0, 0}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := LoadKVCacheFromDisk(path, stream, backend); err == nil {
+		t.Fatal("a version 1 spill file was accepted")
+	}
 }
 
 func assertFloat32Equal(t *testing.T, label string, got, want []float32) {

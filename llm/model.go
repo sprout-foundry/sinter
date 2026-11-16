@@ -714,25 +714,49 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 			return fmt.Errorf("delta prefill: %w", err)
 		}
 	} else if len(parts) > 0 && slotIdx >= 0 && shared == len(tokenIDs) {
-		// Exact image-prompt hit. The slot proves these exact images were
-		// seen before, but it cannot save the prefill: a DeltaNet layer's
-		// recurrent state is a single accumulated value with no way back, so
-		// the cache cannot be rewound to re-derive the final position's
-		// logits. Re-prefilling from the restored state would append a
-		// duplicate position instead. The match is still worth making: it
-		// keeps the slot's LRU fresh for a prompt that is evidently in use.
-		m.prefixSlots[slotIdx].lastUsed = m.prefixSeq
+		// Exact image-prompt hit. A DeltaNet layer's recurrent state cannot be
+		// rewound to re-derive the last position's logits, so this used to
+		// re-run the whole prefill. The slot carries that position's hidden
+		// state instead, which is all the logits need: restore the cache, then
+		// run the final norm and vocabulary head.
+		//
+		// A slot without a hidden state (written by an older build, or by an
+		// architecture that does not record one) falls through to a full
+		// prefill.
 		mm, ok := m.arch.(MultimodalArchitecture)
 		if !ok {
 			return fmt.Errorf("llm: model %q does not support image input", m.cfg.Arch)
 		}
-		var delta int
-		logits, delta, err = mm.ForwardPrefillImages(m.makeIDsArray(tokenIDs), len(tokenIDs), spans, pixels, cache)
-		if err != nil {
-			return fmt.Errorf("image prefill: %w", err)
+		m.prefixSlots[slotIdx].lastUsed = m.prefixSeq
+		ch, canSkip := m.arch.(CachedHiddenArchitecture)
+		var slotCache *KVCache
+		if canSkip {
+			slotCache, err = m.ensureSlotResident(slotIdx)
+			if err != nil {
+				return fmt.Errorf("load spilled prefix slot: %w", err)
+			}
 		}
-		m.posDelta = delta
-		mm.SetPositionDelta(delta)
+		if canSkip && slotCache.LastHidden() != nil {
+			if err := cache.RestorePrefix(slotCache); err != nil {
+				return fmt.Errorf("restore prefix: %w", err)
+			}
+			// SetPositionDelta still has to run: the generated tokens after
+			// this prompt are placed by 3-D position, not token index.
+			m.posDelta = m.prefixSlots[slotIdx].posDelta
+			mm.SetPositionDelta(m.posDelta)
+			logits, err = ch.LogitsFromHidden(cache.LastHidden())
+			if err != nil {
+				return fmt.Errorf("logits from cached hidden: %w", err)
+			}
+		} else {
+			var delta int
+			logits, delta, err = mm.ForwardPrefillImages(m.makeIDsArray(tokenIDs), len(tokenIDs), spans, pixels, cache)
+			if err != nil {
+				return fmt.Errorf("image prefill: %w", err)
+			}
+			m.posDelta = delta
+			mm.SetPositionDelta(delta)
+		}
 	} else if len(spans) > 0 {
 		// Multimodal: no prefix-cache matching (the cache keys on token ids,
 		// which cannot distinguish two different images), and the whole
@@ -780,13 +804,11 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 	// keeps just the prompt prefix alive). Drop caching for very long
 	// prompts so a huge history doesn't pin memory forever.
 	//
-	// Image prompts do not store a slot. The key match cannot save the
-	// prefill (a DeltaNet state cannot be rewound to re-derive the last
-	// position's logits), and a slot would buy nothing measurable: a
-	// repeated image prompt measured 134ms -> 121ms, which is noise, because
-	// the prefill runs either way. Storing one would only add a spill and
-	// reload per request.
-	if len(parts) == 0 && len(tokenIDs) <= m.maxPrefixLenTokens() {
+	// Image prompts store a slot too. The cache key has to carry the image
+	// hash for the match to be safe, and the slot now carries the last
+	// position's hidden state, so a repeated prompt skips the prefill
+	// entirely instead of re-running it for no gain.
+	if len(tokenIDs) <= m.maxPrefixLenTokens() {
 		snap, snapErr := cache.SnapshotPrefixCopy()
 		if snapErr != nil {
 			return fmt.Errorf("snapshot prefix: %w", snapErr)

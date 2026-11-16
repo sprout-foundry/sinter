@@ -190,6 +190,30 @@ type MultimodalArchitecture interface {
 	SetPositionDelta(delta int)
 }
 
+// CachedHiddenArchitecture is implemented by architectures that can produce
+// the last position's logits from a stored hidden state alone, without
+// re-running the prompt.
+//
+// This is what makes an exact prompt cache hit cheap on a hybrid model. A
+// DeltaNet layer's recurrent state is a single accumulated value: restoring a
+// snapshot leaves the state at the *end* of the prompt, and there is no way
+// back to the last position's hidden state. Re-prefilling from it would
+// append a duplicate position instead of recovering that one. But the hidden
+// state itself is small ([1,1,H], a few KB), so a slot can simply keep it,
+// and a hit costs one final norm plus the vocabulary projection.
+type CachedHiddenArchitecture interface {
+	Architecture
+
+	// LastHidden returns the retained [1,1,H] hidden state at the last
+	// processed position. The caller must not free it; copy it if it must
+	// outlive the next forward pass.
+	LastHidden() tensor.Array
+
+	// LogitsFromHidden applies the final norm and vocabulary head to a
+	// [1,1,H] hidden state, returning logits for that position.
+	LogitsFromHidden(h tensor.Array) ([]float32, error)
+}
+
 // ModelConfig holds architecture-independent configuration values. Every
 // decoder-only transformer shares these fields; architecture-specific values
 // (e.g. QK norm presence, bias presence) are encoded as booleans that the

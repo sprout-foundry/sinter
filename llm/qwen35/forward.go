@@ -736,6 +736,12 @@ func (q *Qwen35) prefillInternalChunk(ids tensor.Array, seqLen, startPos int, ca
 	if err := q.setLastHidden(h, seqLen); err != nil {
 		return nil, err
 	}
+	// Record it on the cache too, so an exact prompt hit can produce the last
+	// position's logits without re-running the prompt. The cache takes its own
+	// reference; this one is released with h below.
+	if cache != nil {
+		cache.SetLastHidden(q.backend.RetainArray(q.lastHidden))
+	}
 	if debugMem {
 		logPrefillLayerMem(-1, "after-setLastHidden", seqLen)
 	}
@@ -1024,6 +1030,19 @@ func (q *Qwen35) setLastHidden(h tensor.Array, seqLen int) error {
 // LastHidden returns the retained main-model hidden state at the last
 // processed position. The caller must not free it.
 func (q *Qwen35) LastHidden() tensor.Array { return q.lastHidden }
+
+// LogitsFromHidden applies the final norm and vocabulary head to a [1,1,H]
+// hidden state. This is the whole cost of an exact prompt cache hit: the
+// prefix's K/V and recurrent state are already in the cache, and the last
+// position's hidden state is all that stands between them and the logits.
+func (q *Qwen35) LogitsFromHidden(h tensor.Array) ([]float32, error) {
+	logits, err := q.computeLogits(h)
+	if err != nil {
+		return nil, err
+	}
+	defer logits.Free()
+	return q.logitsToFloat32(logits)
+}
 
 // MTPAvailable reports whether the loaded weights include a multi-token
 // prediction head (raw Qwen3.5 HF exports; mlx-community conversions strip

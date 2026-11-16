@@ -29,6 +29,14 @@ type KVCache struct {
 	stream      tensor.Stream
 	backend     tensor.Backend
 
+	// lastHidden is the [1,1,H] hidden state at the last position the cache
+	// was populated for. It is what makes an exact prompt cache hit cheap:
+	// the recurrent state cannot be rewound to re-derive that position, but
+	// the hidden state it produced is only a few KB, so keeping it lets a
+	// hit skip the prefill and run just the final norm plus vocab head.
+	// nil when the architecture does not record it.
+	lastHidden tensor.Array
+
 	// pending collects arrays queued by StoreState/AppendWindow for the next
 	// FlushPending call. Batching these into one AsyncEvalBatch call instead
 	// of dispatching each individually cuts 32 per-token dispatch calls
@@ -88,6 +96,23 @@ func (c *KVCache) FlushPending() error {
 	c.pending = c.pending[:0]
 	return err
 }
+
+// SetLastHidden records the [1,1,H] hidden state at the last populated
+// position. The cache takes ownership; a previous value is freed. Pass nil
+// to clear it.
+func (c *KVCache) SetLastHidden(h tensor.Array) {
+	if c.lastHidden == h {
+		return
+	}
+	if c.lastHidden != nil {
+		c.lastHidden.Free()
+	}
+	c.lastHidden = h
+}
+
+// LastHidden returns the recorded hidden state, or nil if none was set. The
+// cache retains ownership — copy it to outlive the cache.
+func (c *KVCache) LastHidden() tensor.Array { return c.lastHidden }
 
 // IsInitialized reports whether a layer's cache has been populated.
 func (c *KVCache) IsInitialized(layerIdx int) bool {
@@ -352,6 +377,14 @@ func (c *KVCache) SnapshotPrefixCopy() (*KVCache, error) {
 		snap.layers[i] = cp
 		snap.initialized[i] = c.initialized[i]
 	}
+	if c.lastHidden != nil {
+		h, err := copyOf(c.lastHidden)
+		if err != nil {
+			snap.Free()
+			return nil, err
+		}
+		snap.lastHidden = h
+	}
 	return snap, nil
 }
 
@@ -401,6 +434,11 @@ func (c *KVCache) RestorePrefix(snap *KVCache) error {
 		c.layers[i] = cp
 		c.initialized[i] = snap.initialized[i]
 	}
+	if snap.lastHidden != nil {
+		c.SetLastHidden(c.backend.RetainArray(snap.lastHidden))
+	} else {
+		c.SetLastHidden(nil)
+	}
 	return nil
 }
 
@@ -421,6 +459,10 @@ func (c *KVCache) Free() {
 				layer.ConvState.Free()
 			}
 		}
+	}
+	if c.lastHidden != nil {
+		c.lastHidden.Free()
+		c.lastHidden = nil
 	}
 }
 
@@ -553,7 +595,9 @@ func (c *KVCache) growLayer(l *KVCacheLayer, tokShape []int, dt tensor.Dtype, ne
 // detected and rejected instead of misread.
 var kvSpillMagic = [4]byte{'S', 'P', 'K', 'V'}
 
-const kvSpillVersion = uint32(1)
+// kvSpillVersion 2 added the trailing last-hidden record. Version 1 files
+// are rejected rather than read with the wrong layout.
+const kvSpillVersion = uint32(2)
 
 // SaveToDisk serializes the cache's raw arrays to path (created or
 // truncated). Used to spill an inactive conversation's KV cache out of GPU
@@ -617,6 +661,15 @@ func (c *KVCache) SaveToDisk(path string) (err error) {
 			if err := writeSpillArray(w, l.ConvState); err != nil {
 				return fmt.Errorf("kv_cache: write layer %d ConvState: %w", i, err)
 			}
+		}
+	}
+	hasHidden := c.lastHidden != nil
+	if err := binary.Write(w, binary.LittleEndian, hasHidden); err != nil {
+		return err
+	}
+	if hasHidden {
+		if err := writeSpillArray(w, c.lastHidden); err != nil {
+			return fmt.Errorf("kv_cache: write last hidden: %w", err)
 		}
 	}
 	return w.Flush()
@@ -726,6 +779,17 @@ func LoadKVCacheFromDisk(path string, s tensor.Stream, backend tensor.Backend) (
 		}
 		c.layers[i] = l
 		c.initialized[i] = true
+	}
+	var hasHidden bool
+	if err := binary.Read(r, binary.LittleEndian, &hasHidden); err != nil {
+		return nil, err
+	}
+	if hasHidden {
+		h, herr := readSpillArray(r, backend)
+		if herr != nil {
+			return nil, fmt.Errorf("kv_cache: read last hidden: %w", herr)
+		}
+		c.lastHidden = h
 	}
 	return c, nil
 }
