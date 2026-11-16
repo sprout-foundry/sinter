@@ -129,8 +129,8 @@ func TestRecommendModelForRAM(t *testing.T) {
 		{24 * testGB, "qwen3.5-9b"},
 		{32 * testGB, "qwen3.5-9b"},
 		{40 * testGB, "qwen3.5-9b"},
-		{48 * testGB, "qwen3.5-9b"},  // qwen3.8-27b is explicit only
-		{128 * testGB, "qwen3.5-9b"}, // so is the unwarned default never a 27b or 35b
+		{48 * testGB, "qwen3.6-35b-a3b"},  // the MoE is the default from 48GB
+		{128 * testGB, "qwen3.6-35b-a3b"}, // qwen3.8-27b is explicit only
 	}
 	for _, tc := range cases {
 		m := RecommendModelForRAM(tc.ram)
@@ -144,9 +144,9 @@ func TestRecommendModelForRAM(t *testing.T) {
 // blocked matrix requested: <8GB suggested=gemma4-e2b no stretch; 8-16GB
 // suggested=gemma4-e2b stretch=qwen3.5-4b; 16-24GB suggested=qwen3.5-4b
 // (gemma4-e2b now a safe downgrade, not blocked) stretch=qwen3.5-9b;
-// 24-32GB suggested=qwen3.5-9b no stretch; 32GB+ suggested=qwen3.5-9b
-// stretch=qwen3.8-27b and qwen3.6-35b-a3b (qwen3.8-27b is explicit only, so it
-// is never suggested).
+// 24-32GB suggested=qwen3.5-9b no stretch; 32-48GB suggested=qwen3.5-9b
+// stretch=qwen3.6-35b-a3b and qwen3.8-27b; 48GB+ suggested=qwen3.6-35b-a3b
+// stretch=qwen3.8-27b (explicit only, so it is never suggested).
 // Anything smaller than suggested is always a selectable (eligible)
 // downgrade, never blocked — only tiers beyond the one-up stretch are
 // genuinely blocked.
@@ -181,10 +181,10 @@ func TestTieredCatalogForRAM(t *testing.T) {
 			"minicpm5-2b": TierEligible, "gemma4-e2b": TierEligible, "qwen3.5-4b": TierEligible, "qwen3.5-9b": TierSuggested, "qwen3.8-27b": TierStretch, "qwen3.6-35b-a3b": TierStretch,
 		}},
 		{"48gb", 48 * testGB, map[string]TierStatus{
-			"minicpm5-2b": TierEligible, "gemma4-e2b": TierEligible, "qwen3.5-4b": TierEligible, "qwen3.5-9b": TierSuggested, "qwen3.8-27b": TierStretch, "qwen3.6-35b-a3b": TierStretch,
+			"minicpm5-2b": TierEligible, "gemma4-e2b": TierEligible, "qwen3.5-4b": TierEligible, "qwen3.5-9b": TierEligible, "qwen3.8-27b": TierStretch, "qwen3.6-35b-a3b": TierSuggested,
 		}},
 		{"128gb", 128 * testGB, map[string]TierStatus{
-			"minicpm5-2b": TierEligible, "gemma4-e2b": TierEligible, "qwen3.5-4b": TierEligible, "qwen3.5-9b": TierSuggested, "qwen3.8-27b": TierStretch, "qwen3.6-35b-a3b": TierStretch,
+			"minicpm5-2b": TierEligible, "gemma4-e2b": TierEligible, "qwen3.5-4b": TierEligible, "qwen3.5-9b": TierEligible, "qwen3.8-27b": TierStretch, "qwen3.6-35b-a3b": TierSuggested,
 		}},
 	}
 	for _, tc := range cases {
@@ -239,5 +239,25 @@ func TestSelectModelForRAMNeverPicksExplicitOnly(t *testing.T) {
 	}
 	if status, ok := SelectableForRAM("qwen3.8-27b", 64*testGB); !ok || status != TierStretch {
 		t.Fatalf("qwen3.8-27b at 64GB: %v %v; it stays selectable by name", status, ok)
+	}
+}
+
+// TestSelectModelForRAMPrefersTheMoE: from 48GB the installed MoE is the
+// pick over a smaller dense model, and the explicit-only 27B never is.
+func TestSelectModelForRAMPrefersTheMoE(t *testing.T) {
+	root := t.TempDir()
+	for _, d := range []string{"qwen3.5-9b-4bit", "qwen3.6-35b-a3b-4bit", "qwen3.8-27b-4bit"} {
+		if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		ram  uint64
+		want string
+	}{{32 * testGB, "qwen3.5-9b"}, {48 * testGB, "qwen3.6-35b-a3b"}, {64 * testGB, "qwen3.6-35b-a3b"}} {
+		m, err := SelectModelForRAM(root, tc.ram)
+		if err != nil || m.Name != tc.want {
+			t.Errorf("%dGB: got %v, %v; want %s", tc.ram/testGB, m, err, tc.want)
+		}
 	}
 }
