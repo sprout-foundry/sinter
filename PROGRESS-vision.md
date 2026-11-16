@@ -1,13 +1,13 @@
 # Vision input for sinter — progress
 
-Last updated: 2026-11-16 11:25
+Last updated: 2026-11-16 13:50
 
 ## Status
 
-Vision works end to end on **both backends**, and an exact image-prompt
-repeat now skips the prefill (309ms → 2ms). GGML was finished first; MLX
-was blocked by an ABI mismatch that has now been found and fixed, and the
-three bugs it had been masking are fixed too.
+Vision works end to end on **both backends**, and an exact prompt repeat —
+image or text — now skips the prefill (309ms → 2ms and 44ms → 1ms). GGML was
+finished first; MLX was blocked by an ABI mismatch that has now been found
+and fixed, and the three bugs it had been masking are fixed too.
 
 Verified on MLX (`Qwen3.5-2B-4bit`) over HTTP: a base64 PNG of vertical
 stripes returns "this image displays a vibrant, abstract pattern composed
@@ -110,10 +110,10 @@ rather than misread). `CachedHiddenArchitecture` exposes `LastHidden` and
 `LogitsFromHidden`; qwen35 implements it, and an architecture that does not
 keeps the old full-prefill behaviour.
 
-On an exact image-prompt hit the code restores the slot's cache and runs
-only the final norm plus the vocabulary head. **Prefill 309ms → 2ms**, with
-the answer identical across runs — including after the slot has been
-spilled to disk and reloaded.
+On an exact prompt hit — image or text — the code restores the slot's cache
+and runs only the final norm plus the vocabulary head. **Prefill 309ms → 2ms**
+for images and **44ms → 1ms** for text, with the answer identical across
+runs, including after the slot has been spilled to disk and reloaded.
 
 Image prompts now store a prefix slot; the keying (`imageKeyFor`, hashed
 over preprocessed pixels + grid + order) was already correct and is what
@@ -122,10 +122,14 @@ makes the match safe.
 Two tests guard it, because the earlier attempt produced a plausible but
 wrong answer:
 
-- `TestImageCacheHitSkipsPrefill` asserts the work actually went away, by
-  comparing warm prefill against a cold run. The correctness test next door
-  would pass even if the hit silently fell back to a full prefill. Verified
-  to fail with the optimization disabled (126ms → 105ms).
+- `TestImageCacheHitSkipsPrefill` and `TestTextExactHitSkipsPrefill` assert
+  the work actually went away, by comparing warm prefill against a cold run.
+  The correctness tests next door would pass even if the hit silently fell
+  back to a full prefill. Both verified to fail with the optimization
+  disabled (126ms → 105ms, and 34ms → 35ms).
+- `TestTextMultiTurnStillDeltas` checks the other direction: a growing
+  conversation must keep taking the delta path, or every turn would return
+  the first turn's answer.
 - `TestKVCacheDiskRoundTrip` covers the hidden state, so a spill that
   dropped it surfaces here rather than as a silent full prefill on reload.
 
@@ -142,10 +146,9 @@ Getting this far also exposed two GGML ownership bugs, both fixed:
    `SnapshotPrefix` remains for the MTP and prompt-lookup rollback paths,
    which free their snapshot before anything else runs.
 
-Still open: a text prompt whose *entire* prompt matches a slot does not use
-this path (it falls through to a full prefill, since `shared == len` leaves
-no delta). The same hidden-state trick would apply; it was left out to keep
-the text hot path untouched.
+Still open: nothing on the caching path. A text prompt whose whole prompt
+matches a slot now takes the same route as an image prompt (44ms → 1ms),
+and a growing conversation still uses the delta path.
 
 ## Verified commands
 
