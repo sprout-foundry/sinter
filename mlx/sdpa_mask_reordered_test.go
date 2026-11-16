@@ -109,9 +109,9 @@ func TestSpikeSDPAMaskCostReordered(t *testing.T) {
 			var out *Array
 			var err error
 			if masked {
-				out, err = FastScaledDotProductAttention(qBf, kBf, vBf, scale, "array", mask4, nil, s)
+				out, err = FastScaledDotProductAttention(qBf, kBf, vBf, scale, "array", mask4, nil, false, s)
 			} else {
-				out, err = FastScaledDotProductAttention(qBf, kBf, vBf, scale, "", nil, nil, s)
+				out, err = FastScaledDotProductAttention(qBf, kBf, vBf, scale, "", nil, nil, false, s)
 			}
 			if err != nil {
 				t.Fatal(err)

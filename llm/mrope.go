@@ -108,24 +108,33 @@ func (m *MRoPE) Tables(t, h, w []int, b tensor.Backend, s tensor.Stream) (cosArr
 	return cosArr, sinArr, nil
 }
 
-// ApplyMRoPE rotates x (shape [1, heads, n, headDim]) by the given cos/sin
-// tables. The rotation pairs element i with element i+headDim/2, which is
-// the non-traditional (GPT-NeoX) convention FastRoPE uses with
-// traditional=false.
-func ApplyMRoPE(x, cos, sin tensor.Array, b tensor.Backend, s tensor.Stream) (tensor.Array, error) {
+// ApplyMRoPE rotates the first rotaryDims elements of x's head dim by the
+// given cos/sin tables, leaving the rest untouched. cos/sin are
+// [1, 1, n, rotaryDims].
+//
+// The rotation pairs element i with element i+rotaryDims/2, the
+// non-traditional (GPT-NeoX) convention FastRoPE uses with
+// traditional=false. Only a partial slice of the head rotates: with head_dim
+// 256 and partial_rotary_factor 0.25, 64 of 256 dims carry position
+// information and the remaining 192 pass through unrotated.
+func ApplyMRoPE(x, cos, sin tensor.Array, rotaryDims int, b tensor.Backend, s tensor.Stream) (tensor.Array, error) {
 	shape := x.Shape()
 	if len(shape) != 4 {
 		return nil, fmt.Errorf("mrope: expected 4-D input, got %v", shape)
 	}
-	half := shape[3] / 2
+	headDim := shape[3]
+	if rotaryDims <= 0 || rotaryDims > headDim || rotaryDims%2 != 0 {
+		return nil, fmt.Errorf("mrope: rotary dims %d invalid for head dim %d", rotaryDims, headDim)
+	}
+	half := rotaryDims / 2
 
-	// rot(x) = cat(-x2, x1) over the head dim.
+	// rot(x) = cat(-x2, x1) over the rotated slice.
 	x1, err := b.Slice(x, []int{0, 0, 0, 0}, []int{shape[0], shape[1], shape[2], half}, []int{1, 1, 1, 1}, s)
 	if err != nil {
 		return nil, fmt.Errorf("mrope slice x1: %w", err)
 	}
 	defer x1.Free()
-	x2, err := b.Slice(x, []int{0, 0, 0, half}, []int{shape[0], shape[1], shape[2], shape[3]}, []int{1, 1, 1, 1}, s)
+	x2, err := b.Slice(x, []int{0, 0, 0, half}, []int{shape[0], shape[1], shape[2], rotaryDims}, []int{1, 1, 1, 1}, s)
 	if err != nil {
 		return nil, fmt.Errorf("mrope slice x2: %w", err)
 	}
@@ -142,7 +151,14 @@ func ApplyMRoPE(x, cos, sin tensor.Array, b tensor.Backend, s tensor.Stream) (te
 	}
 	defer rotated.Free()
 
-	scaled, err := b.Multiply(x, cos, s)
+	// The rotated slice, as a standalone tensor to broadcast against.
+	head, err := b.Slice(x, []int{0, 0, 0, 0}, []int{shape[0], shape[1], shape[2], rotaryDims}, []int{1, 1, 1, 1}, s)
+	if err != nil {
+		return nil, fmt.Errorf("mrope slice head: %w", err)
+	}
+	defer head.Free()
+
+	scaled, err := b.Multiply(head, cos, s)
 	if err != nil {
 		return nil, fmt.Errorf("mrope x*cos: %w", err)
 	}
@@ -153,5 +169,21 @@ func ApplyMRoPE(x, cos, sin tensor.Array, b tensor.Backend, s tensor.Stream) (te
 	}
 	defer rotScaled.Free()
 
-	return b.Add(scaled, rotScaled, s)
+	rotatedSlice, err := b.Add(scaled, rotScaled, s)
+	if err != nil {
+		return nil, fmt.Errorf("mrope add: %w", err)
+	}
+	defer rotatedSlice.Free()
+
+	if rotaryDims == headDim {
+		return b.RetainArray(rotatedSlice), nil
+	}
+
+	// Stitch the rotated slice back onto the untouched remainder.
+	tail, err := b.Slice(x, []int{0, 0, 0, rotaryDims}, []int{shape[0], shape[1], shape[2], headDim}, []int{1, 1, 1, 1}, s)
+	if err != nil {
+		return nil, fmt.Errorf("mrope slice tail: %w", err)
+	}
+	defer tail.Free()
+	return b.ConcatenateAxis([]tensor.Array{rotatedSlice, tail}, 3, s)
 }

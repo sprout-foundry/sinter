@@ -146,7 +146,7 @@ func TestSpikeSDPAPaddedBufferParity(t *testing.T) {
 		t.Fatalf("slice v: %v", err)
 	}
 	t.Cleanup(vRef.Free)
-	ref, err := FastScaledDotProductAttention(q, kRef, vRef, scale, "", nil, nil, s)
+	ref, err := FastScaledDotProductAttention(q, kRef, vRef, scale, "", nil, nil, false, s)
 	if err != nil {
 		t.Fatalf("sdpa ref: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestSpikeSDPAPaddedBufferParity(t *testing.T) {
 	}
 	t.Cleanup(mask4.Free)
 
-	got, err := FastScaledDotProductAttention(q, kPad, vPad, scale, "array", mask4, nil, s)
+	got, err := FastScaledDotProductAttention(q, kPad, vPad, scale, "array", mask4, nil, false, s)
 	if err != nil {
 		t.Fatalf("sdpa padded: %v", err)
 	}

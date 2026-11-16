@@ -79,6 +79,8 @@ int mlx_shim_resolve_dispatch(void* handle, mlx_shim_dispatch_t* d) {
   if (!p) return 0; d->mlx_dequantize = (int (*)(mlx_array* res, const mlx_array w, const mlx_array scales, const mlx_array biases , mlx_optional_int group_size, mlx_optional_int bits, const char* mode, const mlx_array global_scale , mlx_optional_dtype dtype, const mlx_stream s))p;
   p = dlsym(handle, "mlx_device_free");
   if (!p) return 0; d->mlx_device_free = (int (*)(mlx_device dev))p;
+  p = dlsym(handle, "mlx_device_get_type");
+  if (!p) return 0; d->mlx_device_get_type = (int (*)(mlx_device_type* type, mlx_device dev))p;
   p = dlsym(handle, "mlx_device_is_available");
   if (!p) return 0; d->mlx_device_is_available = (int (*)(bool* avail, mlx_device dev))p;
   p = dlsym(handle, "mlx_device_new_type");
@@ -126,7 +128,7 @@ int mlx_shim_resolve_dispatch(void* handle, mlx_shim_dispatch_t* d) {
   p = dlsym(handle, "mlx_fast_rope_dynamic");
   if (!p) return 0; d->mlx_fast_rope_dynamic = (int (*)(mlx_array* res, const mlx_array x, int dims, bool traditional, mlx_optional_float base, float scale, const mlx_array offset, const mlx_array freqs , const mlx_stream s))p;
   p = dlsym(handle, "mlx_fast_scaled_dot_product_attention");
-  if (!p) return 0; d->mlx_fast_scaled_dot_product_attention = (int (*)(mlx_array* res, const mlx_array queries, const mlx_array keys, const mlx_array values, float scale, const char* mask_mode, const mlx_array mask_arr , const mlx_array sinks , const mlx_stream s))p;
+  if (!p) return 0; d->mlx_fast_scaled_dot_product_attention = (int (*)(mlx_array* res, const mlx_array queries, const mlx_array keys, const mlx_array values, float scale, const char* mask_mode, const mlx_array mask_arr , const mlx_array sinks , bool force_fused, const mlx_stream s))p;
   p = dlsym(handle, "mlx_gather");
   if (!p) return 0; d->mlx_gather = (int (*)(mlx_array* res, const mlx_array a, const mlx_vector_array indices, const int* axes, size_t axes_num, const int* slice_sizes, size_t slice_sizes_num, const mlx_stream s))p;
   p = dlsym(handle, "mlx_gather_qmm");
@@ -221,6 +223,8 @@ int mlx_shim_resolve_dispatch(void* handle, mlx_shim_dispatch_t* d) {
   if (!p) return 0; d->mlx_stack = (int (*)(mlx_array* res, const mlx_vector_array arrays, const mlx_stream s))p;
   p = dlsym(handle, "mlx_stream_free");
   if (!p) return 0; d->mlx_stream_free = (int (*)(mlx_stream stream))p;
+  p = dlsym(handle, "mlx_stream_get_device");
+  if (!p) return 0; d->mlx_stream_get_device = (int (*)(mlx_device* dev, mlx_stream stream))p;
   p = dlsym(handle, "mlx_stream_new_device");
   if (!p) return 0; d->mlx_stream_new_device = (mlx_stream (*)(mlx_device dev))p;
   p = dlsym(handle, "mlx_subtract");

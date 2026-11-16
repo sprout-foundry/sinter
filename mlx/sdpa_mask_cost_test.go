@@ -108,7 +108,7 @@ func TestSpikeSDPADecodeMaskCost(t *testing.T) {
 	}
 
 	bench("sdpa-unmasked", func() error {
-		o, err := FastScaledDotProductAttention(qB, kPadB, vPadB, scale, "", nil, nil, s)
+		o, err := FastScaledDotProductAttention(qB, kPadB, vPadB, scale, "", nil, nil, false, s)
 		if err != nil {
 			return err
 		}
@@ -118,7 +118,7 @@ func TestSpikeSDPADecodeMaskCost(t *testing.T) {
 	out.Free()
 
 	bench("sdpa-arraymask", func() error {
-		o, err := FastScaledDotProductAttention(qB, kPadB, vPadB, scale, "array", maskB, nil, s)
+		o, err := FastScaledDotProductAttention(qB, kPadB, vPadB, scale, "array", maskB, nil, false, s)
 		if err != nil {
 			return err
 		}

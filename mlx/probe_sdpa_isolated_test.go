@@ -32,7 +32,7 @@ func TestFusedAttentionAvailability(t *testing.T) {
 		t.Skipf("no GPU stream: %v", err)
 	}
 
-	const b, h, l, d = 1, 2, 4, 16
+	const b, h, l, d = 1, 2, 4, 64
 	q, err := NewArrayFromFloat32(make([]float32, b*h*l*d), []int{b, h, l, d})
 	if err != nil {
 		t.Fatalf("array: %v", err)
@@ -46,7 +46,7 @@ func TestFusedAttentionAvailability(t *testing.T) {
 		t.Fatalf("array: %v", err)
 	}
 
-	out, err := FastScaledDotProductAttention(q, k, v, 0.25, "causal", nil, nil, s)
+	out, err := FastScaledDotProductAttention(q, k, v, 0.25, "causal", nil, nil, true, s)
 	if err != nil {
 		t.Skipf("fused attention unavailable in this environment: %v", err)
 	}

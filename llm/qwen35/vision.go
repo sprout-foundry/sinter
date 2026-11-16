@@ -226,12 +226,12 @@ func (t *visionTower) forward(patches tensor.Array, img visionImage) (tensor.Arr
 	numPatches := gridH * gridW
 
 	// Patch embed: [numPatches, window] @ [window, hidden] + bias.
-	h, err := b.MatMul(patches, t.patchW, s)
+	proj, err := b.MatMul(patches, t.patchW, s)
 	if err != nil {
 		return nil, fmt.Errorf("vision patch embed matmul: %w", err)
 	}
-	defer h.Free()
-	h, err = addVectorBias(h, t.patchBias, numPatches, cfg.HiddenSize, b, s)
+	defer proj.Free()
+	h, err := addVectorBias(proj, t.patchBias, numPatches, cfg.HiddenSize, b, s)
 	if err != nil {
 		return nil, fmt.Errorf("vision patch embed bias: %w", err)
 	}
@@ -358,10 +358,9 @@ func (t *visionTower) block(blk *visionBlock, x tensor.Array, seqLen int, cos, s
 	defer kRot.Free()
 
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
-	// Vision attention is non-causal across the whole image. "none" is the
-	// explicit no-mask mode; the empty string the text model passes for
-	// single-token decode is not valid at this sequence length.
-	ctx, err := b.FastScaledDotProductAttention(qRot, kRot, v, scale, "none", nil, nil, s)
+	// Vision attention is non-causal across the whole image: an empty
+	// mask_mode with no mask array is full attention.
+	ctx, err := b.FastScaledDotProductAttention(qRot, kRot, v, scale, "", nil, nil, s)
 	if err != nil {
 		return nil, fmt.Errorf("attention: %w", err)
 	}
@@ -555,7 +554,18 @@ func loadFlattenedTransposed(sf *llm.SafetensorsFile, name string, b tensor.Back
 	defer tr.Free()
 	// Some backends keep the transposed rank (ggml returns [1,1,window,out]),
 	// so normalize back to the 2-D shape MatMul expects.
-	return b.Reshape(tr, []int{window, outDim}, s)
+	weight, err := b.Reshape(tr, []int{window, outDim}, s)
+	if err != nil {
+		return nil, fmt.Errorf("%s: reshape: %w", name, err)
+	}
+	// Materialize before returning: the tower runs on the inference thread,
+	// and a lazy graph built here would keep this load-time stream baked in,
+	// failing to evaluate later with "no Stream(gpu, 0) in current thread".
+	if err := weight.Eval(); err != nil {
+		weight.Free()
+		return nil, fmt.Errorf("%s: eval: %w", name, err)
+	}
+	return weight, nil
 }
 
 // addVectorBias adds a [width] bias to a [rows, width] tensor.

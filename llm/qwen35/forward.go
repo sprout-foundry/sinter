@@ -139,7 +139,16 @@ func New(cfg llm.ModelConfig, backend tensor.Backend) (llm.Architecture, error) 
 
 func (q *Qwen35) Config() llm.ModelConfig { return q.cfg }
 
-func (q *Qwen35) SetStream(s tensor.Stream) { q.stream = s }
+// SetStream sets the stream for subsequent forward passes. The vision tower
+// holds its own reference, so it must follow: it is loaded on the model-load
+// thread but run on the inference thread, and an MLX stream only evaluates on
+// the thread that created it.
+func (q *Qwen35) SetStream(s tensor.Stream) {
+	q.stream = s
+	if q.vision != nil {
+		q.vision.stream = s
+	}
+}
 
 // weights holds every MLX array for the model. embed is the (possibly
 // quantized) word embedding. When UseTiedEmbeddings is set, embed.Logits is
@@ -1429,11 +1438,11 @@ func (q *Qwen35) fullAttention(h tensor.Array, lw *layerWeights, layerIdx, seqLe
 	if q.imgCos != nil {
 		// Image chunk: per-token 3-D positions. The tables cover ropeDims,
 		// so rotate that slice and leave the rest untouched.
-		qRot, err = llm.ApplyMRoPE(qT, q.imgCos, q.imgSin, q.backend, s)
+		qRot, err = llm.ApplyMRoPE(qT, q.imgCos, q.imgSin, ropeDims, q.backend, s)
 		if err != nil {
 			return nil, fmt.Errorf("q mrope: %w", err)
 		}
-		kRot, err = llm.ApplyMRoPE(kT, q.imgCos, q.imgSin, q.backend, s)
+		kRot, err = llm.ApplyMRoPE(kT, q.imgCos, q.imgSin, ropeDims, q.backend, s)
 		if err != nil {
 			qRot.Free()
 			return nil, fmt.Errorf("k mrope: %w", err)

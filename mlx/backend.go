@@ -292,7 +292,10 @@ func (b *MetalBackend) FastScaledDotProductAttention(q, k, v tensor.Array, scale
 	if sinks != nil {
 		sa = sinks.(*Array)
 	}
-	return FastScaledDotProductAttention(q.(*Array), k.(*Array), v.(*Array), scale, maskMode, ma, sa, toStream(s))
+	// forceFused stays false: the fused kernel has a minimum sequence length
+	// and a fixed set of supported head dims, and forcing it turns every
+	// unsupported shape into a hard error instead of the unfused fallback.
+	return FastScaledDotProductAttention(q.(*Array), k.(*Array), v.(*Array), scale, maskMode, ma, sa, false, toStream(s))
 }
 
 func (b *MetalBackend) FastRoPE(x tensor.Array, dims int, traditional bool, base float64, scale float32, offset int, freqs tensor.Array, s tensor.Stream) (tensor.Array, error) {

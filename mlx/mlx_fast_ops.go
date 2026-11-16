@@ -195,8 +195,13 @@ func FastRoPEDynamic(x *Array, dims int, traditional bool, base float64, scale f
 }
 
 // FastScaledDotProductAttention applies fused attention with optional mask.
-// maskMode is one of "none", "causal", "generic".
-func FastScaledDotProductAttention(q, k, v *Array, scale float32, maskMode string, maskArr, sinks *Array, s *Stream) (*Array, error) {
+// maskMode is "", "causal" or "array". An empty maskMode with no maskArr is
+// full (unmasked) attention.
+//
+// forceFused makes MLX fail rather than fall back to the unfused path when no
+// fused kernel matches the shapes. Pass false for decode: the fused kernel has
+// a minimum sequence length, so short prompts must take the fallback.
+func FastScaledDotProductAttention(q, k, v *Array, scale float32, maskMode string, maskArr, sinks *Array, forceFused bool, s *Stream) (*Array, error) {
 	out := newOutput()
 	mode := C.CString(maskMode)
 	defer C.free(unsafe.Pointer(mode))
@@ -207,7 +212,7 @@ func FastScaledDotProductAttention(q, k, v *Array, scale float32, maskMode strin
 	if sinks != nil {
 		snk = sinks.cHandle()
 	}
-	rc := C.mlx_fast_scaled_dot_product_attention(&out, q.cHandle(), k.cHandle(), v.cHandle(), C.float(scale), mode, m, snk, s.cHandle())
+	rc := C.mlx_fast_scaled_dot_product_attention(&out, q.cHandle(), k.cHandle(), v.cHandle(), C.float(scale), mode, m, snk, C.bool(forceFused), s.cHandle())
 	return wrapResult(out, rc, "fast_sdpa")
 }
 

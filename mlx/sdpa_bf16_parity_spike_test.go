@@ -109,7 +109,7 @@ func TestSpikeSDPABF16MaskedVsExact(t *testing.T) {
 			kRef.Free()
 			t.Fatal(err)
 		}
-		ref, err := FastScaledDotProductAttention(qB, kRef, vRef, scale, "", nil, nil, s)
+		ref, err := FastScaledDotProductAttention(qB, kRef, vRef, scale, "", nil, nil, false, s)
 		kRef.Free()
 		vRef.Free()
 		if err != nil {
@@ -144,7 +144,7 @@ func TestSpikeSDPABF16MaskedVsExact(t *testing.T) {
 			ref.Free()
 			t.Fatal(err)
 		}
-		gotBF, err := FastScaledDotProductAttention(qB, kPad, vPad, scale, "array", mask4, nil, s)
+		gotBF, err := FastScaledDotProductAttention(qB, kPad, vPad, scale, "array", mask4, nil, false, s)
 		mask4.Free()
 		if err != nil {
 			ref.Free()

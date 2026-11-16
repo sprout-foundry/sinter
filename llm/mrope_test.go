@@ -5,6 +5,8 @@ package llm
 import (
 	"math"
 	"testing"
+
+	"github.com/sprout-foundry/sinter/tensor"
 )
 
 // TestMRoPEPositions pins the 3-D position layout against the reference's
@@ -149,6 +151,67 @@ func TestMRoPETablesTextMatchesPlainRoPE(t *testing.T) {
 			if math.Abs(got-want) > 1e-12 {
 				t.Fatalf("slot %d: %v != %v", f, got, want)
 			}
+		}
+	}
+}
+
+// TestApplyMRoPEPartialRotation checks that only the first rotaryDims columns
+// of the head rotate. A full-head rotation against a rotaryDims-wide table
+// does not fail loudly — it either errors on the shape mismatch or, when the
+// shapes happen to line up, silently rotates dims the model expects to pass
+// through unchanged.
+func TestApplyMRoPEPartialRotation(t *testing.T) {
+	backend := tensor.DetectBackend()
+	if backend == nil || !backend.Available() {
+		t.Skip("no tensor backend available on this platform")
+	}
+	stream, err := backend.DefaultGPUStream()
+	if err != nil {
+		t.Fatalf("get stream: %v", err)
+	}
+	defer stream.Free()
+
+	const heads, n, headDim, rotaryDims = 1, 1, 8, 4
+	// Distinct values so a wrongly-rotated tail is detectable: the tail
+	// (columns 4..7) must come back bit-identical.
+	vals := []float32{1, 2, 3, 4, 100, 200, 300, 400}
+	x, err := backend.NewArrayFromFloat32(vals, []int{1, heads, n, headDim})
+	if err != nil {
+		t.Fatalf("new array: %v", err)
+	}
+	defer x.Free()
+
+	// cos=1, sin=0 for every position: rotation is the identity, so the
+	// whole tensor must round-trip unchanged.
+	cos, err := backend.NewArrayFromFloat32([]float32{1, 1, 1, 1}, []int{1, 1, n, rotaryDims})
+	if err != nil {
+		t.Fatalf("new cos: %v", err)
+	}
+	defer cos.Free()
+	sin, err := backend.NewArrayFromFloat32([]float32{0, 0, 0, 0}, []int{1, 1, n, rotaryDims})
+	if err != nil {
+		t.Fatalf("new sin: %v", err)
+	}
+	defer sin.Free()
+
+	out, err := ApplyMRoPE(x, cos, sin, rotaryDims, backend, stream)
+	if err != nil {
+		t.Fatalf("ApplyMRoPE: %v", err)
+	}
+	defer out.Free()
+	if err := out.Eval(); err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	got, err := out.Float32Data()
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(got) != len(vals) {
+		t.Fatalf("got %d values, want %d", len(got), len(vals))
+	}
+	for i := range vals {
+		if math.Abs(float64(got[i]-vals[i])) > 1e-5 {
+			t.Fatalf("element %d: got %v, want %v (identity rotation must be a no-op)", i, got[i], vals[i])
 		}
 	}
 }
