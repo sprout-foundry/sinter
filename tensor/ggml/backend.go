@@ -1237,14 +1237,15 @@ func (a *Array) Eval() error {
 }
 
 func (a *Array) Free() {
-	if a.alloc != nil {
-		C.ggml_gallocr_free(a.alloc)
-		a.alloc = nil
-	}
 	t := a.cTensor()
 	// Release the pinned buffer and registry entry once the last wrapper goes
 	// away. Without this a single forward pass retains every intermediate it
 	// ever produced.
+	//
+	// The graph allocator is released under the same condition. A retained
+	// wrapper (RetainArray) shares the tensor and the refcount but carries no
+	// alloc of its own, so freeing the allocator on the first Free leaves a
+	// live snapshot pointing into a freed graph buffer.
 	if a.refs != nil && t != nil && a.backend != nil {
 		if atomic.AddInt32(a.refs, -1) == 0 {
 			b := a.backend
@@ -1266,8 +1267,15 @@ func (a *Array) Free() {
 			if a.result {
 				atomic.AddInt64(&b.resultLive, -1)
 			}
+			if a.alloc != nil {
+				C.ggml_gallocr_free(a.alloc)
+				a.alloc = nil
+			}
 		}
 		a.refs = nil
+	} else if a.alloc != nil {
+		C.ggml_gallocr_free(a.alloc)
+		a.alloc = nil
 	}
 	a.tensor = nil
 	a.tRef = nil

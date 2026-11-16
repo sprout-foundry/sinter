@@ -782,10 +782,15 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 	//
 	// Image prompts do not store a slot. The key match cannot save the
 	// prefill (a DeltaNet state cannot be rewound to re-derive the last
-	// position's logits), and spilling an image prompt's cache crashes in
-	// the GGML spill path, so the slot would cost memory and buy nothing.
+	// position's logits), and a slot would buy nothing measurable: a
+	// repeated image prompt measured 134ms -> 121ms, which is noise, because
+	// the prefill runs either way. Storing one would only add a spill and
+	// reload per request.
 	if len(parts) == 0 && len(tokenIDs) <= m.maxPrefixLenTokens() {
-		snap := cache.SnapshotPrefix()
+		snap, snapErr := cache.SnapshotPrefixCopy()
+		if snapErr != nil {
+			return fmt.Errorf("snapshot prefix: %w", snapErr)
+		}
 		logGenMem("after-SnapshotPrefix")
 		newIdx := m.storePrefixSlot(m.storeIndexFor(slotIdx), append([]int(nil), tokenIDs...), imageKey, m.posDelta, snap)
 		logGenMem("after-storePrefixSlot")
@@ -1493,7 +1498,12 @@ func (m *Model) WarmSystemPrefix(prompt string) error {
 			return
 		}
 
-		newIdx := m.storePrefixSlot(-1, tokenIDs, "", 0, cache.SnapshotPrefix())
+		snap, snapErr := cache.SnapshotPrefixCopy()
+		if snapErr != nil {
+			warmErr = fmt.Errorf("snapshot system prefix: %w", snapErr)
+			return
+		}
+		newIdx := m.storePrefixSlot(-1, tokenIDs, "", 0, snap)
 		m.prefixSlots[newIdx].protected = true
 		m.spillIdleSlots(newIdx)
 	})

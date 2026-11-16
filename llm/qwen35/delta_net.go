@@ -232,15 +232,15 @@ func (g *gatedDeltaNet) forward(x tensor.Array, cache *llm.KVCache, layerIdx, se
 	defer convOut.Free()
 
 	// silu(conv) — the conv output is the "conv feature" gating.
-	convOut, err = llm.SiLU(convOut, b, s)
+	convAct, err := llm.SiLU(convOut, b, s)
 	if err != nil {
 		return nil, fmt.Errorf("conv silu: %w", err)
 	}
-	defer convOut.Free()
+	defer convAct.Free()
 
 	// Split conv output into q, k, v: q/k have numK heads, v has numV heads.
 	// conv_out is [B, S, conv_dim]; key_dim is the first chunk.
-	qkvSplit, err := b.SplitAxis(convOut, []int{g.keyDim, 2 * g.keyDim}, 2, s)
+	qkvSplit, err := b.SplitAxis(convAct, []int{g.keyDim, 2 * g.keyDim}, 2, s)
 	if err != nil {
 		return nil, fmt.Errorf("conv split: %w", err)
 	}
@@ -272,16 +272,16 @@ func (g *gatedDeltaNet) forward(x tensor.Array, cache *llm.KVCache, layerIdx, se
 
 	// Scale-normalized q/k (rms_norm with no weight, then scale).
 	invScale := 1.0 / sqrt(float64(g.headDim))
-	q2d, err = scaleRMSNorm(q2d, float32(invScale*invScale), b, s)
+	qNorm, err := scaleRMSNorm(q2d, float32(invScale*invScale), b, s)
 	if err != nil {
 		return nil, fmt.Errorf("q rmsnorm: %w", err)
 	}
-	defer q2d.Free()
-	k2d, err = scaleRMSNorm(k2d, float32(invScale), b, s)
+	defer qNorm.Free()
+	kNorm, err := scaleRMSNorm(k2d, float32(invScale), b, s)
 	if err != nil {
 		return nil, fmt.Errorf("k rmsnorm: %w", err)
 	}
-	defer k2d.Free()
+	defer kNorm.Free()
 
 	// beta = sigmoid(b); g = exp(-exp(A_log) * softplus(a + dt_bias))
 	beta, err := b.Sigmoid(bOut, s)
@@ -296,7 +296,7 @@ func (g *gatedDeltaNet) forward(x tensor.Array, cache *llm.KVCache, layerIdx, se
 	}
 	defer decay.Free()
 	// Recurrent update.
-	y, newState, err := gatedDeltaUpdate(q2d, k2d, v2d, decay, beta, state, b, s)
+	y, newState, err := gatedDeltaUpdate(qNorm, kNorm, v2d, decay, beta, state, b, s)
 	if err != nil {
 		return nil, fmt.Errorf("gated delta update: %w", err)
 	}

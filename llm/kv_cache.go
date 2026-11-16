@@ -261,6 +261,11 @@ func (c *KVCache) CachedLen() int {
 // the original. The original still owns its arrays; free the snapshot when
 // done. Used by prefix caching to keep a prompt-only snapshot alive while
 // the working cache continues decoding.
+//
+// Retaining is only safe while the snapshot lives no longer than the arrays
+// it points at. A snapshot kept across other forwards must use
+// SnapshotPrefixCopy: on GGML, retained arrays share a buffer that the
+// working cache's next forward recycles back into the pool.
 func (c *KVCache) SnapshotPrefix() *KVCache {
 	snap := &KVCache{
 		layers:      make([]*KVCacheLayer, len(c.layers)),
@@ -294,6 +299,60 @@ func (c *KVCache) SnapshotPrefix() *KVCache {
 		snap.initialized[i] = c.initialized[i]
 	}
 	return snap
+}
+
+// SnapshotPrefixCopy returns a new KVCache holding its own copies of this
+// cache's arrays. Unlike SnapshotPrefix the result shares no storage with the
+// working cache, so it survives any number of later forwards and can be
+// spilled to disk.
+//
+// This is what prefix slots use. The copy is a read-back and rebuild rather
+// than a backend clone op, because the buffers a retained wrapper points at
+// are recycled by the next forward on GGML — the same reason SaveToDisk
+// reads through RawBytes.
+func (c *KVCache) SnapshotPrefixCopy() (*KVCache, error) {
+	snap := &KVCache{
+		layers:      make([]*KVCacheLayer, len(c.layers)),
+		initialized: make([]bool, len(c.initialized)),
+		stream:      c.stream,
+		backend:     c.backend,
+	}
+	copyOf := func(a tensor.Array) (tensor.Array, error) {
+		if a == nil {
+			return nil, nil
+		}
+		raw, err := a.RawBytes()
+		if err != nil {
+			return nil, fmt.Errorf("kv_cache: snapshot read: %w", err)
+		}
+		return c.backend.NewArrayFromBytes(raw, a.Shape(), a.Dtype())
+	}
+	for i, l := range c.layers {
+		if l == nil {
+			continue
+		}
+		cp := &KVCacheLayer{capacity: l.capacity, used: l.used}
+		var err error
+		if cp.K, err = copyOf(l.K); err != nil {
+			snap.Free()
+			return nil, err
+		}
+		if cp.V, err = copyOf(l.V); err != nil {
+			snap.Free()
+			return nil, err
+		}
+		if cp.State, err = copyOf(l.State); err != nil {
+			snap.Free()
+			return nil, err
+		}
+		if cp.ConvState, err = copyOf(l.ConvState); err != nil {
+			snap.Free()
+			return nil, err
+		}
+		snap.layers[i] = cp
+		snap.initialized[i] = c.initialized[i]
+	}
+	return snap, nil
 }
 
 // RestorePrefix copies the retained prefix arrays from snap into this cache,
