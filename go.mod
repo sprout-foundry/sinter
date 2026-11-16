@@ -2,6 +2,8 @@ module github.com/sprout-foundry/sinter
 
 go 1.26.0
 
-require golang.org/x/sys v0.45.0
-
-require golang.org/x/text v0.42.0 // indirect
+require (
+	golang.org/x/image v0.46.0
+	golang.org/x/sys v0.48.0
+	golang.org/x/text v0.42.0
+)
