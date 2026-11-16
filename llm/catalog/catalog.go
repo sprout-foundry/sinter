@@ -107,10 +107,12 @@ var ModelCatalog = []CatalogModel{
 		Dir:  "qwen3.6-35b-a3b-4bit",
 		// MoE: ~35B total params, ~3B active per token. Full expert set must
 		// still be resident, so the memory cost tracks total params, not
-		// active params.
+		// active params (~18 GiB). Reading only ~3B parameters per token
+		// makes it far faster than a dense model of its quality, so it is
+		// the default where it fits with room for the KV cache and the OS.
 		HFRepo:          "mlx-community/Qwen3.6-35B-A3B-4bit",
 		MinRAMSelect:    32 * gb,
-		MinRAMSuggested: math.MaxUint64, // top-of-line: always an explicit, warned pick
+		MinRAMSuggested: 48 * gb,
 	},
 	{
 		// Edge0-35B-A3B-preview: the same qwen3_5_moe language model as the
