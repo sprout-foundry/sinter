@@ -10,6 +10,7 @@
 package llm
 
 import (
+	"github.com/sprout-foundry/sinter/llm/vision"
 	"github.com/sprout-foundry/sinter/tensor"
 )
 
@@ -158,6 +159,37 @@ type CompiledGreedyArchitecture interface {
 	ReleaseCompiledDecode()
 }
 
+// ImageInput is one image's token span inside a prompt, paired with the
+// patch grid the vision tower produced for it. Start is the index of the
+// first image token; the span length is gridH/merge * gridW/merge * gridT.
+type ImageInput struct {
+	Start   int
+	GridTHW [3]int
+}
+
+// MultimodalArchitecture is implemented by architectures whose text model
+// takes 3-D (time, row, column) rotary positions. A prompt containing images
+// runs through ForwardPrefillImages; text-only prompts keep using the plain
+// 1-D path, which stays bit-identical to the text-only engine.
+type MultimodalArchitecture interface {
+	Architecture
+
+	// ImageTokens reports how many <|image_pad|> tokens one image expands
+	// to, given the patch grid the vision tower produced for it.
+	ImageTokens(gridTHW [3]int) int
+
+	// ForwardPrefillImages prefills a prompt whose image token spans carry
+	// 3-D positions, encoding the images first. images must be sorted by
+	// Start and non-overlapping; pixels[i] belongs to images[i]. Returns the
+	// logits for the last position and the position delta that text
+	// following the prompt must add to its 1-D position.
+	ForwardPrefillImages(ids tensor.Array, seqLen int, images []ImageInput, pixels []*vision.Pixels, cache *KVCache) (logits []float32, posDelta int, err error)
+
+	// SetPositionDelta sets the shift applied to decode positions after a
+	// prompt that contained images. Text-only generation leaves it at 0.
+	SetPositionDelta(delta int)
+}
+
 // ModelConfig holds architecture-independent configuration values. Every
 // decoder-only transformer shares these fields; architecture-specific values
 // (e.g. QK norm presence, bias presence) are encoded as booleans that the
@@ -193,6 +225,7 @@ type ModelConfig struct {
 	PartialRotaryFactor   float32  // fraction of head dim rotated by RoPE (0.25 for qwen3_5)
 	MRopeSection          []int    // mRoPE section sizes [T, H, W]
 	MRopeInterleaved      bool     // mRoPE interleaved vs half-split
+	VisionSpatialMerge    int      // vision tower's spatial merge factor (2 for qwen3.5)
 	MTPNumHiddenLayers    int      // multi-token prediction layers
 	MTPUseDedicatedEmbeds bool     // MTP uses its own embedding table when true
 	NumExperts            int      // MoE: total number of experts (0 = dense model)
@@ -222,6 +255,16 @@ type ModelConfig struct {
 // layers (Qwen3.5-style hybrid).
 func (c ModelConfig) HybridLinearAttn() bool {
 	return c.FullAttentionInterval > 0 && c.LinearNumKeyHeads > 0
+}
+
+// VisionSpatialMergeSize returns the vision tower's spatial merge factor,
+// defaulting to 2 when the config carries none (every qwen3.5 checkpoint
+// uses 2).
+func (c ModelConfig) VisionSpatialMergeSize() int {
+	if c.VisionSpatialMerge > 0 {
+		return c.VisionSpatialMerge
+	}
+	return 2
 }
 
 // QuantConfig describes weight quantization for a model. It is set from the

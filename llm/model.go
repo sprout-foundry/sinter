@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sprout-foundry/sinter/llm/vision"
 	"github.com/sprout-foundry/sinter/tensor"
 )
 
@@ -49,6 +50,12 @@ type Model struct {
 	thinkID      int
 	endThinkID   int
 	inThinkBlock bool
+
+	// posDelta is the shift between 3-D position and token count for the
+	// current call. Non-zero only for prompts containing images, where the
+	// image spans advance positions by a different amount than their token
+	// count. Reset at the start of every Generate.
+	posDelta int
 
 	// multimodalIDs are vocab entries for modalities this text-only engine
 	// can never legitimately emit — image/audio/video placeholders inherited
@@ -134,6 +141,13 @@ type prefixSlot struct {
 	// this same one's next turn) loses the warm cache and pays a full
 	// re-prefill again. See warmSystemPrefix in local_provider.go.
 	protected bool
+
+	// imageKey identifies the images embedded in this slot's prompt. Token
+	// ids alone cannot: two different images expand to the same
+	// <|image_pad|> run, so a token-only match would reuse K/V computed from
+	// the wrong picture. Empty means a text-only prompt. A slot only
+	// matches a request whose imageKey is identical.
+	imageKey string
 }
 
 // minPrefixReuse is the smallest shared token prefix worth reusing.
@@ -487,6 +501,54 @@ func (m *Model) Generate(ctx context.Context, prompt string, genCfg GenerateConf
 	})
 }
 
+// ImagePart is one image in a multimodal prompt: its decoded pixels (already
+// resized and normalized by the vision package) and the text offset where
+// its placeholder run sits in the prompt.
+type ImagePart struct {
+	// Pixels is the preprocessed image, laid out as the vision tower's
+	// input: NumPatches rows of patchSize*patchSize*3 values.
+	Pixels *vision.Pixels
+	// AfterText is the prompt text that precedes this image's placeholder
+	// run. The model locates the run by tokenizing the text before it.
+	AfterText string
+}
+
+// GenerateMultimodal runs generation for a prompt containing images.
+//
+// The prompt must contain one <|vision_start|><|image_pad|><|vision_end|>
+// marker per image, in the same order as parts. Each marker's single
+// <|image_pad|> token is expanded here to the number of tokens the vision
+// tower produces for that image, which is only known after preprocessing —
+// that is why the expansion cannot happen in the chat template.
+//
+// Prefix caching is skipped for multimodal prompts: the cache keys on token
+// ids, and two different images produce identical ids.
+func (m *Model) GenerateMultimodal(ctx context.Context, prompt string, parts []ImagePart, genCfg GenerateConfig, onToken func(tokenID int)) error {
+	if len(parts) == 0 {
+		return m.Generate(ctx, prompt, genCfg, onToken)
+	}
+	return m.onInferenceThread(func() error {
+		return m.generateMultimodal(ctx, prompt, parts, genCfg, onToken)
+	})
+}
+
+// generateMultimodal is GenerateMultimodal's locked entry point.
+func (m *Model) generateMultimodal(ctx context.Context, prompt string, parts []ImagePart, genCfg GenerateConfig, onToken func(tokenID int)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return fmt.Errorf("llm: model is closed")
+	}
+	var genErr error
+	m.runOnGPUThread(func() {
+		genErr = m.generateLockedParts(ctx, prompt, parts, genCfg, onToken)
+	})
+	return genErr
+}
+
 // onInferenceThread runs fn on the model's dedicated inference thread.
 func (m *Model) onInferenceThread(fn func() error) error {
 	m.inferOnce.Do(func() {
@@ -528,14 +590,42 @@ func (m *Model) generate(ctx context.Context, prompt string, genCfg GenerateConf
 // generateLocked runs the generation loop's GPU work on the model's
 // dedicated GPU thread (see runOnGPUThread). Only called from Generate,
 // which holds m.mu for the whole call.
+//
+// parts is nil for a text-only prompt. When non-nil, the prompt's image
+// markers are expanded and the image spans take 3-D rotary positions.
 func (m *Model) generateLocked(ctx context.Context, prompt string, genCfg GenerateConfig, onToken func(tokenID int)) error {
+	return m.generateLockedParts(ctx, prompt, nil, genCfg, onToken)
+}
+
+func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []ImagePart, genCfg GenerateConfig, onToken func(tokenID int)) error {
 	tokenIDs := m.tokenizer.Encode(prompt)
 	if len(tokenIDs) == 0 {
 		return fmt.Errorf("llm: empty prompt after tokenization")
 	}
 
+	// Image prompts expand each <|image_pad|> to the token count the vision
+	// tower produces, which depends on the image's grid — so the expansion
+	// happens here, not in the chat template.
+	var spans []ImageInput
+	var pixels []*vision.Pixels
+	if len(parts) > 0 {
+		var err error
+		tokenIDs, spans, err = m.expandImageMarkers(tokenIDs, parts)
+		if err != nil {
+			return err
+		}
+		pixels = make([]*vision.Pixels, len(parts))
+		for i, p := range parts {
+			pixels[i] = p.Pixels
+		}
+	}
+	m.posDelta = 0
+
 	if m.cfg.BOSTokenID > 0 {
 		tokenIDs = append([]int{m.cfg.BOSTokenID}, tokenIDs...)
+		for i := range spans {
+			spans[i].Start++
+		}
 	}
 
 	// The Qwen3.5 chat template may open a <think> block in the prompt.
@@ -602,6 +692,22 @@ func (m *Model) generateLocked(ctx context.Context, prompt string, genCfg Genera
 		if err != nil {
 			return fmt.Errorf("delta prefill: %w", err)
 		}
+	} else if len(spans) > 0 {
+		// Multimodal: no prefix-cache matching (the cache keys on token ids,
+		// which cannot distinguish two different images), and the whole
+		// prompt runs as one chunk so the per-token position tables stay
+		// aligned.
+		mm, ok := m.arch.(MultimodalArchitecture)
+		if !ok {
+			return fmt.Errorf("llm: model %q does not support image input", m.cfg.Arch)
+		}
+		var delta int
+		logits, delta, err = mm.ForwardPrefillImages(m.makeIDsArray(tokenIDs), len(tokenIDs), spans, pixels, cache)
+		if err != nil {
+			return fmt.Errorf("image prefill: %w", err)
+		}
+		m.posDelta = delta
+		mm.SetPositionDelta(delta)
 	} else {
 		logits, err = m.arch.ForwardPrefill(m.makeIDsArray(tokenIDs), len(tokenIDs), cache)
 		if err != nil {
@@ -648,12 +754,29 @@ func (m *Model) generateLocked(ctx context.Context, prompt string, genCfg Genera
 		m.prefixSlots = append(m.prefixSlots[:slotIdx], m.prefixSlots[slotIdx+1:]...)
 	}
 
+	// posBase is the absolute position of the first generated token. It
+	// normally equals the prompt length, but a prompt containing images
+	// advances 3-D positions by more (or fewer) than its token count, so
+	// decode must continue from where the image positions left off.
+	posBase := len(tokenIDs)
+	if m.posDelta != 0 {
+		posBase += m.posDelta
+	}
+
 	// Fast greedy path: no repetition penalty means we can sample on the GPU
 	// (argmax) and avoid transferring the full [vocab] logits vector each step.
 	greedyArch, greedyOK := m.arch.(GreedyArchitecture)
 	useGPUArgmax := greedyOK && genCfg.Temperature <= 0 && genCfg.RepetitionPenalty == 0
+	// Image prompts step aside from the speculative and compiled paths.
+	// Each derives absolute positions from the token count — compiled sizes
+	// its buffers from promptLen, prompt-lookup's verify batch reuses one
+	// scalar offset, and MTP's draft batch assumes contiguous positions —
+	// which a prompt whose 3-D positions diverge from its token count
+	// violates. Image prompts are short and one-shot, so the throughput those
+	// paths buy is not worth the extra position plumbing.
+	imagePrompt := m.posDelta != 0
 	mtpArch, mtpOK := m.arch.(MTPArchitecture)
-	useMTP := useGPUArgmax && mtpOK && mtpArch.MTPAvailable() && genCfg.MaxMTPDrafts > 0 && genCfg.MaxTokens > 1
+	useMTP := !imagePrompt && useGPUArgmax && mtpOK && mtpArch.MTPAvailable() && genCfg.MaxMTPDrafts > 0 && genCfg.MaxTokens > 1
 	// Pipelined single-token decode (see PipelinedGreedyArchitecture) takes
 	// priority over prompt-lookup: both are decode-loop-level throughput
 	// strategies, and combining them would mean materializing tokens
@@ -715,8 +838,14 @@ func (m *Model) generateLocked(ctx context.Context, prompt string, genCfg Genera
 	// cutoff; SINTER_COMPILED_DECODE=0 opts out. Above the cutoff the path
 	// is declined automatically (staging cost scales with KV size — see the
 	// comment above).
-	usePromptLookup := useGPUArgmax && !useMTP && !usePipelined && genCfg.PromptLookupMaxDrafts > 0 && genCfg.MaxTokens > 1
-	useCompiled := useGPUArgmax && !useMTP && !usePipelined && !usePromptLookup && compiledOK && genCfg.MaxTokens > 1 &&
+	// Image prompts step aside from the compiled and prompt-lookup paths.
+	// Both derive absolute positions from the token count (compiled sizes its
+	// buffers from promptLen; prompt-lookup's verify batch reuses one scalar
+	// offset), which a prompt whose 3-D positions diverge from its token count
+	// violates. Image prompts are short and one-shot, so the throughput these
+	// paths buy is not worth the extra position plumbing.
+	usePromptLookup := !imagePrompt && useGPUArgmax && !useMTP && !usePipelined && genCfg.PromptLookupMaxDrafts > 0 && genCfg.MaxTokens > 1
+	useCompiled := !imagePrompt && useGPUArgmax && !useMTP && !usePipelined && !usePromptLookup && compiledOK && genCfg.MaxTokens > 1 &&
 		len(tokenIDs) <= compiledCtxLimit && os.Getenv("SINTER_COMPILED_DECODE") != "0"
 	if useCompiled {
 		if err := compiledArch.PrepareCompiledDecode(len(tokenIDs), genCfg.MaxTokens, cache); err != nil {
@@ -750,7 +879,7 @@ func (m *Model) generateLocked(ctx context.Context, prompt string, genCfg Genera
 		// MTP-assisted self-speculative decoding: draft k tokens with the
 		// 1-layer MTP head, verify all in one batched main-model forward.
 		mtpDrafts := genCfg.MaxMTPDrafts
-		pos := len(tokenIDs) // position of nextToken (first generated token)
+		pos := posBase // position of nextToken (first generated token)
 	mtpOuter:
 		for i := 1; i < genCfg.MaxTokens; {
 			if err := ctx.Err(); err != nil {
@@ -812,7 +941,7 @@ func (m *Model) generateLocked(ctx context.Context, prompt string, genCfg Genera
 			seedArr.Free()
 			return fmt.Errorf("compiled decode: seed async eval: %w", err)
 		}
-		pos := len(tokenIDs)
+		pos := posBase
 		stepStart := time.Now()
 		pending, err := compiledArch.ForwardDecodeCompiled(seedArr, pos)
 		seedArr.Free()
@@ -888,7 +1017,7 @@ func (m *Model) generateLocked(ctx context.Context, prompt string, genCfg Genera
 			seedArr.Free()
 			return fmt.Errorf("pipelined decode: seed async eval: %w", err)
 		}
-		pos := len(tokenIDs)
+		pos := posBase
 		pending, err := pipelinedArch.ForwardDecodeArgmaxArray(seedArr, pos, cache)
 		seedArr.Free()
 		if err != nil {
@@ -968,7 +1097,7 @@ func (m *Model) generateLocked(ctx context.Context, prompt string, genCfg Genera
 		})
 		maxDraft := genCfg.PromptLookupMaxDrafts
 		ngGramSize := 3
-		pos := len(tokenIDs)
+		pos := posBase
 		allTokens := append(append([]int{}, tokenIDs...), nextToken)
 
 	promptLookupOuter:
@@ -1120,7 +1249,7 @@ func (m *Model) generateLocked(ctx context.Context, prompt string, genCfg Genera
 			if i == 1 {
 				logGenMem("before-first-plain-ForwardDecodeArgmax")
 			}
-			nextToken, err = greedyArch.ForwardDecodeArgmax(nextToken, len(tokenIDs)+i-1, cache)
+			nextToken, err = greedyArch.ForwardDecodeArgmax(nextToken, posBase+i-1, cache)
 			if i == 1 {
 				logGenMem("after-first-plain-ForwardDecodeArgmax")
 			}
@@ -1128,7 +1257,7 @@ func (m *Model) generateLocked(ctx context.Context, prompt string, genCfg Genera
 				return fmt.Errorf("decode step %d: %w", i, err)
 			}
 		} else {
-			logits, err = m.arch.ForwardDecode(nextToken, len(tokenIDs)+i-1, cache)
+			logits, err = m.arch.ForwardDecode(nextToken, posBase+i-1, cache)
 			if err != nil {
 				return fmt.Errorf("decode step %d: %w", i, err)
 			}

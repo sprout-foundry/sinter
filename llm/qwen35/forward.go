@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/sprout-foundry/sinter/llm"
+	"github.com/sprout-foundry/sinter/llm/vision"
 	"github.com/sprout-foundry/sinter/tensor"
 )
 
@@ -87,6 +88,32 @@ type Qwen35 struct {
 	// lora_*.safetensors). Set in InitWeights before the per-layer loop so the
 	// load helpers can merge each target projection into its base weight.
 	lora *llm.LoraAdapter
+
+	// mrope is the 3-D rotary table builder, built lazily from cfg on the
+	// first image prefill. nil means the model has no mrope_section (plain
+	// 1-D RoPE only).
+	mrope *llm.MRoPE
+
+	// vision is the image encoder, loaded only when the checkpoint carries
+	// vision_tower.* weights. nil for text-only checkpoints.
+	vision *visionTower
+
+	// imgCos/imgSin hold the per-token rotary tables for an image prefill
+	// chunk. Both nil outside such a chunk, which selects the scalar-offset
+	// fast path in fullAttention.
+	imgCos, imgSin tensor.Array
+
+	// imgFeatures holds the vision tower's merged output for the current
+	// image prefill, laid out [1, totalImageTokens, hidden] with each
+	// image's tokens concatenated in prompt order. imgSpans gives the token
+	// range each image occupies. Both nil outside an image prefill.
+	imgFeatures tensor.Array
+	imgSpans    []llm.ImageInput
+
+	// posDelta shifts decode positions after a prompt containing images:
+	// text following an image continues from the 3-D position the image
+	// consumed, not from the token count.
+	posDelta int
 }
 
 func New(cfg llm.ModelConfig, backend tensor.Backend) (llm.Architecture, error) {
@@ -320,6 +347,25 @@ func (q *Qwen35) InitWeights(path string, s tensor.Stream) error {
 		return fmt.Errorf("load mtp: %w", err)
 	}
 
+	// Vision tower. Present on multimodal checkpoints; a text-only export
+	// simply has no vision_tower.* keys and stays image-free.
+	if vcfg, verr := loadVisionConfig(filepath.Join(filepath.Dir(path), "config.json")); verr != nil {
+		return fmt.Errorf("load vision config: %w", verr)
+	} else if vcfg != nil {
+		vprefix := "vision_tower."
+		if !sf.Has(vprefix + "patch_embed.proj.weight") {
+			vprefix = "model.visual."
+		}
+		if sf.Has(vprefix + "patch_embed.proj.weight") {
+			tower, terr := loadVisionTower(sf, vprefix, *vcfg, q.backend, s)
+			if terr != nil {
+				return fmt.Errorf("load vision tower: %w", terr)
+			}
+			q.vision = tower
+			q.cfg.VisionSpatialMerge = vcfg.SpatialMergeSize
+		}
+	}
+
 	// Release the file blob from the Go heap so GC can collect it.
 	sf.Release()
 	runtime.GC()
@@ -341,6 +387,10 @@ func (q *Qwen35) FreeWeights() {
 		q.lastHidden = nil
 	}
 	q.weights.embed.Free()
+	if q.vision != nil {
+		q.vision.free()
+		q.vision = nil
+	}
 	if q.weights.lmHead != nil {
 		q.weights.lmHead.Free()
 	}
@@ -399,6 +449,118 @@ func (q *Qwen35) ForwardPrefill(ids tensor.Array, seqLen int, cache *llm.KVCache
 // a repeated prompt's shared prefix is not recomputed.
 func (q *Qwen35) ForwardPrefillFrom(ids tensor.Array, seqLen, startPos int, cache *llm.KVCache) ([]float32, error) {
 	return q.prefillAt(ids, seqLen, startPos, cache)
+}
+
+// ForwardPrefillImages prefills a prompt containing images. The image spans
+// carry 3-D (t, h, w) rotary positions; everything else is ordinary 1-D.
+//
+// The whole prompt runs as ONE chunk. The per-token tables are aligned to
+// the token sequence, so splitting the prompt the way prefillInternal does
+// for long text would need matching table slices — and an image prompt is
+// short by construction (the server caps it), so the chunking it would skip
+// buys nothing.
+func (q *Qwen35) ForwardPrefillImages(ids tensor.Array, seqLen int, images []llm.ImageInput, pixels []*vision.Pixels, cache *llm.KVCache) ([]float32, int, error) {
+	if len(images) == 0 {
+		logits, err := q.prefillAt(ids, seqLen, 0, cache)
+		return logits, 0, err
+	}
+	if q.vision == nil {
+		return nil, 0, fmt.Errorf("qwen35: model has no vision tower")
+	}
+	if len(pixels) != len(images) {
+		return nil, 0, fmt.Errorf("qwen35: %d image spans but %d images", len(images), len(pixels))
+	}
+	if q.mrope == nil {
+		// mrope_section describes the rotated slice only: with head_dim 256
+		// and partial_rotary_factor 0.25, 64 dims rotate and the sections sum
+		// to their 32 frequencies.
+		rotated := q.rotatedDims()
+		m, err := llm.NewMRoPE(q.cfg.MRopeSection, q.cfg.RopeTheta, rotated)
+		if err != nil {
+			return nil, 0, fmt.Errorf("qwen35: build mrope: %w", err)
+		}
+		q.mrope = m
+	}
+
+	placeholders := make([]llm.ImagePlaceholder, len(images))
+	for i, img := range images {
+		placeholders[i] = llm.ImagePlaceholder{Start: img.Start, GridTHW: img.GridTHW}
+	}
+	t, h, w, advance, err := llm.MRoPEPositions(seqLen, placeholders, q.cfg.VisionSpatialMergeSize())
+	if err != nil {
+		return nil, 0, fmt.Errorf("qwen35: image positions: %w", err)
+	}
+
+	// The tables cover only the rotated slice of the head dim.
+	cos, sin, err := q.mrope.Tables(t, h, w, q.backend, q.stream)
+	if err != nil {
+		return nil, 0, fmt.Errorf("qwen35: mrope tables: %w", err)
+	}
+	q.imgCos, q.imgSin = cos, sin
+	defer func() {
+		q.imgCos, q.imgSin = nil, nil
+		cos.Free()
+		sin.Free()
+	}()
+
+	// Encode the images and splice their features into the placeholder
+	// rows during the prefill pass.
+	features, err := q.encodeImages(pixels, images)
+	if err != nil {
+		return nil, 0, err
+	}
+	q.imgFeatures = features
+	q.imgSpans = images
+	defer func() {
+		q.imgFeatures = nil
+		q.imgSpans = nil
+		features.Free()
+	}()
+
+	logits, err := q.prefillInternalChunk(ids, seqLen, 0, cache, true)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer logits.Free()
+	out, err := q.logitsToFloat32(logits)
+	if err != nil {
+		return nil, 0, err
+	}
+	delta := llm.MRoPEDelta(advance, seqLen)
+	q.posDelta = delta
+	return out, delta, nil
+}
+
+// SetPositionDelta sets the shift applied to decode positions after a
+// prompt that contained images.
+func (q *Qwen35) SetPositionDelta(delta int) { q.posDelta = delta }
+
+// rotatedDims is the number of head dimensions RoPE rotates: the full head
+// dim times partial_rotary_factor (64 of 256 for qwen3.5). The mRoPE
+// frequency sections describe exactly this slice.
+func (q *Qwen35) rotatedDims() int {
+	return int(float64(q.cfg.HeadDim) * float64(q.cfg.PartialRotaryFactor))
+}
+
+// trimRoPETables narrows cos/sin to the first dims columns, matching the
+// partial-rotary slice the scalar RoPE path rotates.
+func trimRoPETables(cos, sin tensor.Array, dims int, b tensor.Backend, s tensor.Stream) (tensor.Array, tensor.Array, error) {
+	shape := cos.Shape()
+	start := []int{0, 0, 0, 0}
+	stop := []int{shape[0], shape[1], shape[2], dims}
+	strides := []int{1, 1, 1, 1}
+	c, err := b.Slice(cos, start, stop, strides, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("qwen35: trim mrope cos: %w", err)
+	}
+	cos.Free()
+	sn, err := b.Slice(sin, start, stop, strides, s)
+	if err != nil {
+		c.Free()
+		return nil, nil, fmt.Errorf("qwen35: trim mrope sin: %w", err)
+	}
+	sin.Free()
+	return c, sn, nil
 }
 
 func (q *Qwen35) prefillAt(ids tensor.Array, seqLen, startPos int, cache *llm.KVCache) ([]float32, error) {
@@ -491,14 +653,28 @@ func (q *Qwen35) prefillInternal(ids tensor.Array, seqLen, startPos int, cache *
 func (q *Qwen35) prefillInternalChunk(ids tensor.Array, seqLen, startPos int, cache *llm.KVCache, needLogits bool) (tensor.Array, error) {
 	s := q.stream
 
-	h, err := q.weights.embed.Lookup(ids, q.backend, s)
+	emb, err := q.weights.embed.Lookup(ids, q.backend, s)
 	if err != nil {
 		return nil, fmt.Errorf("embedding lookup: %w", err)
 	}
-	defer h.Free()
-	h, err = q.backend.SqueezeAxis(h, 2, s)
+	defer emb.Free()
+	h, err := q.backend.SqueezeAxis(emb, 2, s)
 	if err != nil {
 		return nil, fmt.Errorf("squeeze embedding: %w", err)
+	}
+	defer h.Free()
+
+	// Image prefill: replace the placeholder rows with the vision tower's
+	// output. The embeddings computed for those positions are discarded —
+	// the tower's features take their place, as the reference's
+	// masked_scatter does.
+	if q.imgFeatures != nil {
+		spliced, err := q.spliceImageFeatures(h, seqLen)
+		if err != nil {
+			return nil, err
+		}
+		h.Free()
+		h = spliced
 	}
 
 	debugMem := os.Getenv("SINTER_LOCAL_DEBUG") == "1" && os.Getenv("SINTER_PREFILL_LAYER_MEM") == "1"
@@ -1244,16 +1420,31 @@ func (q *Qwen35) fullAttention(h tensor.Array, lw *layerWeights, layerIdx, seqLe
 
 	// Partial RoPE: rotate only partialRotaryFactor of the head dim.
 	ropeDims := int(float64(headDim) * float64(cfg.PartialRotaryFactor))
-	qRot, err := llm.ApplyRoPEFast(qT, startPos, ropeDims, cfg.RopeTheta, q.backend, s)
-	if err != nil {
-		return nil, fmt.Errorf("q rope: %w", err)
+	var qRot, kRot tensor.Array
+	if q.imgCos != nil {
+		// Image chunk: per-token 3-D positions. The tables cover ropeDims,
+		// so rotate that slice and leave the rest untouched.
+		qRot, err = llm.ApplyMRoPE(qT, q.imgCos, q.imgSin, q.backend, s)
+		if err != nil {
+			return nil, fmt.Errorf("q mrope: %w", err)
+		}
+		kRot, err = llm.ApplyMRoPE(kT, q.imgCos, q.imgSin, q.backend, s)
+		if err != nil {
+			qRot.Free()
+			return nil, fmt.Errorf("k mrope: %w", err)
+		}
+	} else {
+		qRot, err = llm.ApplyRoPEFast(qT, startPos, ropeDims, cfg.RopeTheta, q.backend, s)
+		if err != nil {
+			return nil, fmt.Errorf("q rope: %w", err)
+		}
+		kRot, err = llm.ApplyRoPEFast(kT, startPos, ropeDims, cfg.RopeTheta, q.backend, s)
+		if err != nil {
+			qRot.Free()
+			return nil, fmt.Errorf("k rope: %w", err)
+		}
 	}
 	defer qRot.Free()
-
-	kRot, err := llm.ApplyRoPEFast(kT, startPos, ropeDims, cfg.RopeTheta, q.backend, s)
-	if err != nil {
-		return nil, fmt.Errorf("k rope: %w", err)
-	}
 	defer kRot.Free()
 
 	var kForAttn, vForAttn tensor.Array
