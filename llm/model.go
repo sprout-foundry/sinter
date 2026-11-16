@@ -4,8 +4,12 @@ package llm
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -148,6 +152,12 @@ type prefixSlot struct {
 	// the wrong picture. Empty means a text-only prompt. A slot only
 	// matches a request whose imageKey is identical.
 	imageKey string
+
+	// posDelta is how far this prompt's 3-D positions ran past its token
+	// count. Zero for text-only prompts. A cached image prompt needs it to
+	// place the one token it re-prefills after a cache hit, because that
+	// position depends on the images, not just the token count.
+	posDelta int
 }
 
 // minPrefixReuse is the smallest shared token prefix worth reusing.
@@ -662,13 +672,18 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 	// thousands of tokens" call instead of a plain full prefill. That code
 	// path is unproven at scale and not worth the risk; once a conversation
 	// is too big to cache, always fall through to full prefill.
+	// imageKey identifies the images in this prompt. Empty for text-only
+	// prompts, which keeps their cache behavior exactly as before. A slot
+	// built from different images has identical token ids but different
+	// K/V, so the key is part of the match.
+	imageKey := imageKeyFor(parts)
 	shared, slotIdx := 0, -1
 	if len(tokenIDs) <= m.maxPrefixLenTokens() {
-		shared, slotIdx = m.bestPrefixSlot(tokenIDs)
+		shared, slotIdx = m.bestPrefixSlot(tokenIDs, imageKey)
 	}
 	if os.Getenv("SINTER_LOCAL_DEBUG") == "1" {
-		log.Printf("llm: prefix cache: shared=%d slots=%d matchedSlot=%d newPromptLen=%d",
-			shared, len(m.prefixSlots), slotIdx, len(tokenIDs))
+		log.Printf("llm: prefix cache: shared=%d slots=%d matchedSlot=%d newPromptLen=%d images=%d",
+			shared, len(m.prefixSlots), slotIdx, len(tokenIDs), len(parts))
 	}
 	var logits []float32
 	// Only reuse a slot when its ENTIRE token sequence is a true prefix of
@@ -677,8 +692,14 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 	// hit, while unrelated conversations (partial overlap) get a fresh
 	// prefill. The DeltaNet recurrent state is sequence-dependent, so a
 	// partial overlap would corrupt the linear-attention layers.
+	//
+	// Image prompts never take the delta path: a delta prefill has no
+	// per-token position tables, and the positions a prompt containing
+	// images needs cannot be derived from a start offset alone. They still
+	// store a slot, so a repeated identical prompt is a cache hit for the
+	// DeltaNet state and the vision tower output — just not a delta prefill.
 	prefillStart := time.Now()
-	usedDelta := shared >= minPrefixReuse && slotIdx >= 0 && shared < len(tokenIDs)
+	usedDelta := shared >= minPrefixReuse && slotIdx >= 0 && shared < len(tokenIDs) && len(parts) == 0
 	if usedDelta {
 		slotCache, err := m.ensureSlotResident(slotIdx)
 		if err != nil {
@@ -692,6 +713,26 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 		if err != nil {
 			return fmt.Errorf("delta prefill: %w", err)
 		}
+	} else if len(parts) > 0 && slotIdx >= 0 && shared == len(tokenIDs) {
+		// Exact image-prompt hit. The slot proves these exact images were
+		// seen before, but it cannot save the prefill: a DeltaNet layer's
+		// recurrent state is a single accumulated value with no way back, so
+		// the cache cannot be rewound to re-derive the final position's
+		// logits. Re-prefilling from the restored state would append a
+		// duplicate position instead. The match is still worth making: it
+		// keeps the slot's LRU fresh for a prompt that is evidently in use.
+		m.prefixSlots[slotIdx].lastUsed = m.prefixSeq
+		mm, ok := m.arch.(MultimodalArchitecture)
+		if !ok {
+			return fmt.Errorf("llm: model %q does not support image input", m.cfg.Arch)
+		}
+		var delta int
+		logits, delta, err = mm.ForwardPrefillImages(m.makeIDsArray(tokenIDs), len(tokenIDs), spans, pixels, cache)
+		if err != nil {
+			return fmt.Errorf("image prefill: %w", err)
+		}
+		m.posDelta = delta
+		mm.SetPositionDelta(delta)
 	} else if len(spans) > 0 {
 		// Multimodal: no prefix-cache matching (the cache keys on token ids,
 		// which cannot distinguish two different images), and the whole
@@ -720,6 +761,9 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 		if usedDelta {
 			processed = len(tokenIDs) - shared
 			path = "delta"
+		} else if len(parts) > 0 && slotIdx >= 0 && shared == len(tokenIDs) {
+			processed = 1
+			path = "image-cache-hit"
 		}
 		log.Printf("llm: prefill: path=%s tokens_processed=%d elapsed=%.2fs", path, processed, time.Since(prefillStart).Seconds())
 	}
@@ -735,10 +779,15 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 	// (decode appends generated tokens to the working cache; the snapshot
 	// keeps just the prompt prefix alive). Drop caching for very long
 	// prompts so a huge history doesn't pin memory forever.
-	if len(tokenIDs) <= m.maxPrefixLenTokens() {
+	//
+	// Image prompts do not store a slot. The key match cannot save the
+	// prefill (a DeltaNet state cannot be rewound to re-derive the last
+	// position's logits), and spilling an image prompt's cache crashes in
+	// the GGML spill path, so the slot would cost memory and buy nothing.
+	if len(parts) == 0 && len(tokenIDs) <= m.maxPrefixLenTokens() {
 		snap := cache.SnapshotPrefix()
 		logGenMem("after-SnapshotPrefix")
-		newIdx := m.storePrefixSlot(m.storeIndexFor(slotIdx), append([]int(nil), tokenIDs...), snap)
+		newIdx := m.storePrefixSlot(m.storeIndexFor(slotIdx), append([]int(nil), tokenIDs...), imageKey, m.posDelta, snap)
 		logGenMem("after-storePrefixSlot")
 		// Only the conversation that just generated needs to stay
 		// GPU-resident; every other remembered conversation gets spilled to
@@ -1444,7 +1493,7 @@ func (m *Model) WarmSystemPrefix(prompt string) error {
 			return
 		}
 
-		newIdx := m.storePrefixSlot(-1, tokenIDs, cache.SnapshotPrefix())
+		newIdx := m.storePrefixSlot(-1, tokenIDs, "", 0, cache.SnapshotPrefix())
 		m.prefixSlots[newIdx].protected = true
 		m.spillIdleSlots(newIdx)
 	})
@@ -1548,9 +1597,14 @@ func promptEndsInsideThink(tokenIDs []int, thinkID, endThinkID int) bool {
 // sequence-dependent; restoring from any position other than the exact end
 // of a previously-computed sequence would corrupt the linear-attention
 // layers (see minPrefixReuse).
-func (m *Model) bestPrefixSlot(tokenIDs []int) (shared int, idx int) {
+func (m *Model) bestPrefixSlot(tokenIDs []int, imageKey string) (shared int, idx int) {
 	idx = -1
 	for i, slot := range m.prefixSlots {
+		// A slot built from different images has the same token ids but
+		// different K/V, so it must not match even when the ids line up.
+		if slot.imageKey != imageKey {
+			continue
+		}
 		s := longestCommonPrefix(tokenIDs, slot.tokens)
 		if s == len(slot.tokens) && s > shared {
 			shared = s
@@ -1585,7 +1639,7 @@ func (m *Model) storeIndexFor(slotIdx int) int {
 // new entry. Otherwise a new slot is added, evicting the least-recently-used
 // one once at capacity. Callers should follow up with spillIdleSlots(idx) so
 // only the slot just stored stays GPU-resident.
-func (m *Model) storePrefixSlot(matchedIdx int, tokens []int, cache *KVCache) int {
+func (m *Model) storePrefixSlot(matchedIdx int, tokens []int, imageKey string, posDelta int, cache *KVCache) int {
 	m.prefixSeq++
 	if matchedIdx >= 0 {
 		slot := m.prefixSlots[matchedIdx]
@@ -1593,11 +1647,13 @@ func (m *Model) storePrefixSlot(matchedIdx int, tokens []int, cache *KVCache) in
 		slot.cache = cache
 		slot.diskPath = ""
 		slot.tokens = tokens
+		slot.imageKey = imageKey
+		slot.posDelta = posDelta
 		slot.lastUsed = m.prefixSeq
 		return matchedIdx
 	}
 	if len(m.prefixSlots) < m.maxPrefixSlots() {
-		m.prefixSlots = append(m.prefixSlots, &prefixSlot{tokens: tokens, cache: cache, lastUsed: m.prefixSeq})
+		m.prefixSlots = append(m.prefixSlots, &prefixSlot{tokens: tokens, imageKey: imageKey, posDelta: posDelta, cache: cache, lastUsed: m.prefixSeq})
 		return len(m.prefixSlots) - 1
 	}
 	lruIdx := 0
@@ -1607,7 +1663,7 @@ func (m *Model) storePrefixSlot(matchedIdx int, tokens []int, cache *KVCache) in
 		}
 	}
 	m.releaseSlotStorage(m.prefixSlots[lruIdx])
-	m.prefixSlots[lruIdx] = &prefixSlot{tokens: tokens, cache: cache, lastUsed: m.prefixSeq}
+	m.prefixSlots[lruIdx] = &prefixSlot{tokens: tokens, imageKey: imageKey, posDelta: posDelta, cache: cache, lastUsed: m.prefixSeq}
 	return lruIdx
 }
 
@@ -1686,6 +1742,40 @@ func (m *Model) newSpillPath() (string, error) {
 }
 
 // longestCommonPrefix returns the length of the shared prefix of a and b.
+// imageKeyFor derives the cache key for a prompt's images. It hashes the
+// preprocessed pixels rather than the source bytes: the pixels are exactly
+// the tower's input, so two encodings of the same picture that preprocess
+// identically share a key (and their K/V), while any difference that would
+// change the tower's output — size, crop, normalization — changes it.
+//
+// Returns "" for a text-only prompt, which is the value a slot must carry to
+// match a text-only request.
+func imageKeyFor(parts []ImagePart) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	h := sha256.New()
+	for i, p := range parts {
+		if p.Pixels == nil {
+			// No pixels means no tower output; fold the index in so two
+			// such parts do not collide with a text-only prompt.
+			fmt.Fprintf(h, "nil:%d;", i)
+			continue
+		}
+		// Grid first: the same pixel buffer reshaped to a different grid is
+		// a different image as far as positions and token count go.
+		fmt.Fprintf(h, "grid:%d,%d,%d;", p.Pixels.GridTHW[0], p.Pixels.GridTHW[1], p.Pixels.GridTHW[2])
+		fmt.Fprintf(h, "text:%q;", p.AfterText)
+		var buf [4]byte
+		for _, f := range p.Pixels.Data {
+			binary.LittleEndian.PutUint32(buf[:], math.Float32bits(f))
+			h.Write(buf[:])
+		}
+		h.Write([]byte("|"))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 func longestCommonPrefix(a, b []int) int {
 	n := len(a)
 	if len(b) < n {

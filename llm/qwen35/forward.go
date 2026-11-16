@@ -662,7 +662,12 @@ func (q *Qwen35) prefillInternalChunk(ids tensor.Array, seqLen, startPos int, ca
 	if err != nil {
 		return nil, fmt.Errorf("squeeze embedding: %w", err)
 	}
-	defer h.Free()
+	// h is reassigned below when images are present, so it is freed through
+	// this closure rather than a defer on the variable: a deferred h.Free()
+	// would bind to whatever h holds at return, freeing the spliced array
+	// twice (once here, once by setLastHidden's caller) and leaking the
+	// original embedding.
+	defer func() { h.Free() }()
 
 	// Image prefill: replace the placeholder rows with the vision tower's
 	// output. The embeddings computed for those positions are discarded —

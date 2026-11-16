@@ -20,7 +20,7 @@ func TestBestPrefixSlot_PicksLongestFullMatch(t *testing.T) {
 		},
 	}
 
-	shared, idx := m.bestPrefixSlot([]int{1, 2, 3, 4, 5, 7, 8})
+	shared, idx := m.bestPrefixSlot([]int{1, 2, 3, 4, 5, 7, 8}, "")
 
 	if idx != 1 {
 		t.Fatalf("expected slot 1 (longest full-prefix match), got idx=%d", idx)
@@ -36,7 +36,7 @@ func TestBestPrefixSlot_NoMatch(t *testing.T) {
 			{tokens: []int{9, 9, 9}},
 		},
 	}
-	shared, idx := m.bestPrefixSlot([]int{1, 2, 3})
+	shared, idx := m.bestPrefixSlot([]int{1, 2, 3}, "")
 	if idx != -1 || shared != 0 {
 		t.Fatalf("expected no match (idx=-1, shared=0), got idx=%d shared=%d", idx, shared)
 	}
@@ -51,7 +51,7 @@ func TestStorePrefixSlot_EvictsLeastRecentlyUsed(t *testing.T) {
 	const slotCap = maxPrefixSlotsCap
 	m := &Model{prefixSlotsCapOverride: slotCap}
 	for i := range slotCap {
-		m.storePrefixSlot(-1, []int{i}, &KVCache{})
+		m.storePrefixSlot(-1, []int{i}, "", 0, &KVCache{})
 	}
 	if len(m.prefixSlots) != slotCap {
 		t.Fatalf("expected %d slots, got %d", slotCap, len(m.prefixSlots))
@@ -60,12 +60,12 @@ func TestStorePrefixSlot_EvictsLeastRecentlyUsed(t *testing.T) {
 	// Touch every slot except the first (tokens=[0]) by updating it in
 	// place via a matched index, making it the new least-recently-used.
 	for i := 1; i < slotCap; i++ {
-		m.storePrefixSlot(i, []int{i, 100}, &KVCache{})
+		m.storePrefixSlot(i, []int{i, 100}, "", 0, &KVCache{})
 	}
 
 	// Adding one more conversation should evict slot 0 (tokens=[0]),
 	// the only one never re-touched.
-	m.storePrefixSlot(-1, []int{999}, &KVCache{})
+	m.storePrefixSlot(-1, []int{999}, "", 0, &KVCache{})
 
 	if len(m.prefixSlots) != slotCap {
 		t.Fatalf("expected slot count to stay at cap %d, got %d", slotCap, len(m.prefixSlots))

@@ -26,8 +26,13 @@ Known gaps, in priority order:
 3. **GGML pipelined decode crashes** on image prompts (and on text prompts —
    pre-existing). Image prompts now step aside from that path, so they are
    unaffected, but the underlying bug remains.
-4. **Prefix caching is skipped** for image prompts rather than keyed on image
-   content. Correct, but a repeated image pays a full prefill.
+4. **Image prompts are not cached.** The cache key distinguishes images
+   correctly (`imageKeyFor`, hashed over the preprocessed pixels), but image
+   prompts neither store nor match a slot. Storing one buys nothing: a
+   DeltaNet layer's recurrent state cannot be rewound, so a hit cannot skip
+   the prefill, and spilling an image cache crashes in the GGML spill path.
+   The keying is in place for when a cache API that can snapshot a truncated
+   prefix exists.
 
 Scope: Qwen3.5 VL only (the `qwen3_5` wrapper around `qwen3_5_text`), the one
 multimodal family sinter already runs the text half of. Target model for
