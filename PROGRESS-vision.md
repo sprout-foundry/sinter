@@ -1,10 +1,11 @@
 # Vision input for sinter — progress
 
-Last updated: 2026-11-16 05:40
+Last updated: 2026-11-16 11:25
 
 ## Status
 
-Vision works end to end on **both backends**. GGML was finished first; MLX
+Vision works end to end on **both backends**, and an exact image-prompt
+repeat now skips the prefill (309ms → 2ms). GGML was finished first; MLX
 was blocked by an ABI mismatch that has now been found and fixed, and the
 three bugs it had been masking are fixed too.
 
@@ -91,26 +92,44 @@ weights):
    sums to.
 6. **`rope_theta` is 10000000**, not 10000.
 
-## The cache optimization did not land
+## Prefix caching: landed, by keeping the hidden state
 
-The plan called for content-keyed prefix caching that skips work. It was
-measured at **3.32s → 77ms (43×)** for a repeated image, and it **produced a
-wrong answer**.
+The plan called for content-keyed prefix caching that skips work. An early
+attempt measured **3.32s → 77ms (43×)** and **produced a wrong answer**,
+which was put down to a DeltaNet layer's recurrent state being one
+accumulated value with no way back.
 
-Cause is structural: a DeltaNet layer's recurrent state is one accumulated
-value with no way back. A restored snapshot cannot be rewound to re-derive
-the last position's logits; re-prefilling from it appends a duplicate
-position. The speedup was real and the output was plausible — which is why
-the test compares tokens rather than trusting timing.
+That was true but framed the problem wrong. Nothing needs rewinding: the
+logits come from the last position's hidden state, which is `[1,1,H]` — a
+few KB — not from the recurrent state. So the cache now keeps it.
 
-The **keying is in place and correct** (`imageKeyFor`, hashed over
-preprocessed pixels + grid + order). Image prompts still do not store a
-slot, and the reason is now measured rather than assumed: with slots
-enabled, spilling works and the answers stay correct, but a repeated image
-prompt goes 134ms → 121ms — noise, because the prefill runs either way. A
-slot would only add a spill and reload per request.
+`KVCache` carries `lastHidden`, set during prefill, copied by
+`SnapshotPrefixCopy`, retained by `RestorePrefix`, released by `Free`, and
+written to the spill file (format version 1 → 2, so an old file is rejected
+rather than misread). `CachedHiddenArchitecture` exposes `LastHidden` and
+`LogitsFromHidden`; qwen35 implements it, and an architecture that does not
+keeps the old full-prefill behaviour.
 
-Getting that far exposed two real GGML bugs, both fixed:
+On an exact image-prompt hit the code restores the slot's cache and runs
+only the final norm plus the vocabulary head. **Prefill 309ms → 2ms**, with
+the answer identical across runs — including after the slot has been
+spilled to disk and reloaded.
+
+Image prompts now store a prefix slot; the keying (`imageKeyFor`, hashed
+over preprocessed pixels + grid + order) was already correct and is what
+makes the match safe.
+
+Two tests guard it, because the earlier attempt produced a plausible but
+wrong answer:
+
+- `TestImageCacheHitSkipsPrefill` asserts the work actually went away, by
+  comparing warm prefill against a cold run. The correctness test next door
+  would pass even if the hit silently fell back to a full prefill. Verified
+  to fail with the optimization disabled (126ms → 105ms).
+- `TestKVCacheDiskRoundTrip` covers the hidden state, so a spill that
+  dropped it surfaces here rather than as a silent full prefill on reload.
+
+Getting this far also exposed two GGML ownership bugs, both fixed:
 
 1. **`Array.Free` freed the graph allocator unconditionally**, before the
    refcount check. A retained array shares the tensor and refcount but has
@@ -123,8 +142,10 @@ Getting that far exposed two real GGML bugs, both fixed:
    `SnapshotPrefix` remains for the MTP and prompt-lookup rollback paths,
    which free their snapshot before anything else runs.
 
-Unblocking the speedup still needs a `KVCache` API that can snapshot a
-truncated prefix. That is a separate change.
+Still open: a text prompt whose *entire* prompt matches a slot does not use
+this path (it falls through to a full prefill, since `shared == len` leaves
+no delta). The same hidden-state trick would apply; it was left out to keep
+the text hot path untouched.
 
 ## Verified commands
 
