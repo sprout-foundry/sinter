@@ -806,9 +806,9 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 	// absorbs per-op dispatch, which is the same overhead pipelining
 	// removes; on MLX (lazy graph + async eval) the overlap is additive
 	// rather than redundant, which is where this path was originally won.
-	usePipelined := useGPUArgmax && !useMTP && pipelinedOK && genCfg.MaxTokens > 1
+	usePipelined := !imagePrompt && useGPUArgmax && !useMTP && pipelinedOK && genCfg.MaxTokens > 1
 	if v := os.Getenv("SINTER_PIPELINE_DECODE"); v != "" {
-		usePipelined = v == "1" // explicit override (default ON; "0" opts out)
+		usePipelined = v == "1" && !imagePrompt // explicit override (default ON; "0" opts out)
 	}
 	// Compiled decode (CompiledGreedyArchitecture): the whole step runs as
 	// one MLX-compiled graph closure, replaying a cached execution plan

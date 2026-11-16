@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/sprout-foundry/sinter/llm"
+	"github.com/sprout-foundry/sinter/llm/vision"
 )
 
 // Model is the inference surface the server needs. *llm.Model satisfies it;
@@ -37,6 +38,17 @@ type Model interface {
 	// so sprout's context-profile auto-detection (LCM for small windows)
 	// works without relying on a provider-side fallback.
 	ContextLength() int
+}
+
+// MultimodalModel is implemented by models that accept images. The server
+// checks for it only when a request carries images, so text-only models and
+// test fakes keep working unchanged.
+type MultimodalModel interface {
+	Model
+
+	// GenerateMultimodal runs generation for a prompt whose image markers
+	// correspond one-to-one with parts, in order.
+	GenerateMultimodal(ctx context.Context, prompt string, parts []llm.ImagePart, genCfg llm.GenerateConfig, onToken func(tokenID int)) error
 }
 
 // chatRequest mirrors the OpenAI chat-completions request body fields sprout
@@ -63,8 +75,10 @@ type toolFunction struct {
 }
 
 type chatMessage struct {
-	Role       string          `json:"role"`
-	Content    string          `json:"content"`
+	Role string `json:"role"`
+	// Content accepts either a JSON string or an array of parts (the form
+	// OpenAI uses when images are present).
+	Content    messageContent  `json:"content"`
 	ToolCalls  []toolCallChunk `json:"tool_calls,omitempty"`
 	ToolCallID string          `json:"tool_call_id,omitempty"`
 }
@@ -197,9 +211,17 @@ func (s *Server) HandleChat(w http.ResponseWriter, r *http.Request) {
 	// Build the prompt via the chat template.
 	msgs := make([]llm.ChatMessage, len(req.Messages))
 	for i, m := range req.Messages {
-		msgs[i] = llm.ChatMessage{Role: m.Role, Content: m.Content}
+		msgs[i] = llm.ChatMessage{Role: m.Role, Content: m.Content.renderText()}
 	}
-	log.Printf("HandleChat: %d messages, stream=%v, tools=%d, prompt_tokens_est=%d", len(msgs), req.Stream, len(req.Tools), promptTokenEstimate(req.Messages))
+
+	// Decode any images before building the prompt, so an oversized or
+	// malformed image fails the request instead of reaching the model.
+	images, err := s.decodeRequestImages(req.Messages)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	log.Printf("HandleChat: %d messages, stream=%v, tools=%d, images=%d, prompt_tokens_est=%d", len(msgs), req.Stream, len(req.Tools), len(images), promptTokenEstimate(req.Messages))
 
 	// If tools are provided, inject them into the system prompt using the
 	// Qwen3.5 tool-calling template. The fine-tuned model was trained with
@@ -250,13 +272,13 @@ func (s *Server) HandleChat(w http.ResponseWriter, r *http.Request) {
 	// parsing. The finish_reason is set based on whether tool calls were found.
 	_ = len(req.Tools) // tool-call parsing happens in streamChat
 	if req.Stream {
-		s.streamChat(w, r, prompt, cfg, req)
+		s.streamChat(w, r, prompt, images, cfg, req)
 		return
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	text, err := s.model.GenerateText(r.Context(), prompt, cfg)
+	text, err := s.generateText(r.Context(), prompt, images, cfg)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("generation failed: %v", err), http.StatusInternalServerError)
 		return
@@ -290,7 +312,43 @@ func (s *Server) HandleChat(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, prompt string, cfg llm.GenerateConfig, req chatRequest) {
+// generateText runs a non-streaming generation, taking the multimodal path
+// when the request carries images.
+func (s *Server) generateText(ctx context.Context, prompt string, images []*vision.Pixels, cfg llm.GenerateConfig) (string, error) {
+	if len(images) == 0 {
+		return s.model.GenerateText(ctx, prompt, cfg)
+	}
+	mm, ok := s.model.(MultimodalModel)
+	if !ok {
+		return "", fmt.Errorf("model does not support image input")
+	}
+	var tokens []int
+	if err := mm.GenerateMultimodal(ctx, prompt, buildImageParts(images), cfg, func(id int) {
+		tokens = append(tokens, id)
+	}); err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	for _, id := range tokens {
+		sb.WriteString(s.model.DecodeToken(id))
+	}
+	return sb.String(), nil
+}
+
+// generate runs a generation step-by-step, taking the multimodal path when
+// the request carries images.
+func (s *Server) generate(ctx context.Context, prompt string, images []*vision.Pixels, cfg llm.GenerateConfig, onToken func(tokenID int)) error {
+	if len(images) == 0 {
+		return s.model.Generate(ctx, prompt, cfg, onToken)
+	}
+	mm, ok := s.model.(MultimodalModel)
+	if !ok {
+		return fmt.Errorf("model does not support image input")
+	}
+	return mm.GenerateMultimodal(ctx, prompt, buildImageParts(images), cfg, onToken)
+}
+
+func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, prompt string, images []*vision.Pixels, cfg llm.GenerateConfig, req chatRequest) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -330,7 +388,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, prompt strin
 	// XML. When no tools, stream normally for real-time token display.
 	hasTools := len(req.Tools) > 0
 	var outputBuf strings.Builder
-	err := s.model.Generate(r.Context(), prompt, cfg, func(tokenID int) {
+	err := s.generate(r.Context(), prompt, images, cfg, func(tokenID int) {
 		tok := s.model.DecodeToken(tokenID)
 		if hasTools {
 			outputBuf.WriteString(tok)
@@ -470,7 +528,7 @@ func convertToolMessages(msgs []llm.ChatMessage, raw []chatMessage) []llm.ChatMe
 			msgs[i].Content = sb.String()
 		} else if raw.Role == "tool" {
 			msgs[i].Role = "user"
-			msgs[i].Content = "<tool_response>\n" + raw.Content + "\n</tool_response>"
+			msgs[i].Content = "<tool_response>\n" + raw.Content.Text + "\n</tool_response>"
 		}
 	}
 	return msgs
@@ -559,7 +617,7 @@ func parseToolCalls(text string) (content string, toolCalls []toolCallChunk) {
 func promptTokenEstimate(msgs []chatMessage) int {
 	total := 0
 	for _, m := range msgs {
-		total += len(m.Content) / 4
+		total += len(m.Content.Text) / 4
 	}
 	return total
 }
