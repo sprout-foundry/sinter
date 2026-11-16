@@ -104,8 +104,26 @@ position. The speedup was real and the output was plausible — which is why
 the test compares tokens rather than trusting timing.
 
 The **keying is in place and correct** (`imageKeyFor`, hashed over
-preprocessed pixels + grid + order), but image prompts neither store nor
-match a slot. Unblocking it needs a `KVCache` API that can snapshot a
+preprocessed pixels + grid + order). Image prompts still do not store a
+slot, and the reason is now measured rather than assumed: with slots
+enabled, spilling works and the answers stay correct, but a repeated image
+prompt goes 134ms → 121ms — noise, because the prefill runs either way. A
+slot would only add a spill and reload per request.
+
+Getting that far exposed two real GGML bugs, both fixed:
+
+1. **`Array.Free` freed the graph allocator unconditionally**, before the
+   refcount check. A retained array shares the tensor and refcount but has
+   no allocator of its own, so freeing the original left every retained
+   wrapper pointing into a freed graph buffer.
+2. **`SnapshotPrefix` retained arrays into recyclable storage.** The KV
+   cache's buffers go back to the pool on the next forward, so a snapshot
+   taken before a prefill and read after it saw recycled memory. Prefix
+   slots now use `SnapshotPrefixCopy`, which reads back and rebuilds;
+   `SnapshotPrefix` remains for the MTP and prompt-lookup rollback paths,
+   which free their snapshot before anything else runs.
+
+Unblocking the speedup still needs a `KVCache` API that can snapshot a
 truncated prefix. That is a separate change.
 
 ## Verified commands
@@ -130,3 +148,9 @@ SINTER_BACKEND=ggml SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.5-2b-4
   pipelined decode; reproduces on HEAD. It takes the process down, so a
   multi-package `-tags ggml` run reports unrelated packages as FAIL when it
   fires; run packages individually to see real results.
+- `TestImageCacheKeyLiveModel` on GGML — intermittently faults in
+  `ggml_reshape` during a repeated image prefill. Clean HEAD crashes at the
+  same rate, and it reproduces with prefix-slot storage disabled entirely,
+  so it is not the cache. Re-run to get a verdict.
+- `TestDeltaKernelByteIdentity`, `TestDeltaKernelNilState`,
+  `TestCPUQuantFastPaths` in `tensor/ggml` — fail identically on HEAD.
