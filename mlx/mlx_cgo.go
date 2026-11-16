@@ -324,6 +324,12 @@ func NewScalarInt32(v int) (*Array, error) {
 	return wrap(h), nil
 }
 
+// newScalarFloat32 creates a 0-dim float32 array for elementwise
+// broadcasting against a tensor.
+func newScalarFloat32(v float32) *Array {
+	return wrap(C.mlx_array_new_float32(C.float(v)))
+}
+
 // checkShape validates that shape is non-empty and its element product matches
 // the number of elements the caller is about to hand MLX. An empty data slice
 // with a zero-element shape is allowed; mismatched counts corrupt the buffer.

@@ -41,6 +41,8 @@ int mlx_shim_resolve_dispatch(void* handle, mlx_shim_dispatch_t* d) {
   if (!p) return 0; d->mlx_array_new_data = (mlx_array (*)(const void* data, const int* shape, int dim, mlx_dtype dtype))p;
   p = dlsym(handle, "mlx_array_new_float");
   if (!p) return 0; d->mlx_array_new_float = (mlx_array (*)(float val))p;
+  p = dlsym(handle, "mlx_array_new_float32");
+  if (!p) return 0; d->mlx_array_new_float32 = (mlx_array (*)(float val))p;
   p = dlsym(handle, "mlx_array_new_int");
   if (!p) return 0; d->mlx_array_new_int = (mlx_array (*)(int val))p;
   p = dlsym(handle, "mlx_array_set");
@@ -87,8 +89,12 @@ int mlx_shim_resolve_dispatch(void* handle, mlx_shim_dispatch_t* d) {
   if (!p) return 0; d->mlx_enable_compile = (int (*)(void))p;
   p = dlsym(handle, "mlx_equal");
   if (!p) return 0; d->mlx_equal = (int (*)(mlx_array* res, const mlx_array a, const mlx_array b, const mlx_stream s))p;
+  p = dlsym(handle, "mlx_erf");
+  if (!p) return 0; d->mlx_erf = (int (*)(mlx_array* res, const mlx_array a, const mlx_stream s))p;
   p = dlsym(handle, "mlx_exp");
   if (!p) return 0; d->mlx_exp = (int (*)(mlx_array* res, const mlx_array a, const mlx_stream s))p;
+  p = dlsym(handle, "mlx_fast_layer_norm");
+  if (!p) return 0; d->mlx_fast_layer_norm = (int (*)(mlx_array* res, const mlx_array x, const mlx_array weight , const mlx_array bias , float eps, const mlx_stream s))p;
   p = dlsym(handle, "mlx_fast_metal_kernel_apply");
   if (!p) return 0; d->mlx_fast_metal_kernel_apply = (int (*)(mlx_vector_array* outputs, mlx_fast_metal_kernel cls, const mlx_vector_array inputs, const mlx_fast_metal_kernel_config config, const mlx_stream stream))p;
   p = dlsym(handle, "mlx_fast_metal_kernel_config_add_output_arg");

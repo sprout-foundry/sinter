@@ -250,6 +250,13 @@ func Sqrt(a *Array, s *Stream) (*Array, error) {
 	return wrapResult(out, rc, "sqrt")
 }
 
+// Erf returns the elementwise error function.
+func Erf(a *Array, s *Stream) (*Array, error) {
+	out := newOutput()
+	rc := C.mlx_erf(&out, a.cHandle(), s.cHandle())
+	return wrapResult(out, rc, "erf")
+}
+
 // Rsqrt returns the elementwise reciprocal square root (1/sqrt(x)).
 func Rsqrt(a *Array, s *Stream) (*Array, error) {
 	out := newOutput()

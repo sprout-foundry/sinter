@@ -72,6 +72,10 @@ mlx_array mlx_array_new_float(float val) {
   if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return (mlx_array){0}; }
   return mlx_dispatch.mlx_array_new_float(val);
 }
+mlx_array mlx_array_new_float32(float val) {
+  if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return (mlx_array){0}; }
+  return mlx_dispatch.mlx_array_new_float32(val);
+}
 mlx_array mlx_array_new_int(int val) {
   if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return (mlx_array){0}; }
   return mlx_dispatch.mlx_array_new_int(val);
@@ -164,9 +168,17 @@ int mlx_equal(mlx_array* res, const mlx_array a, const mlx_array b, const mlx_st
   if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return 1; }
   return mlx_dispatch.mlx_equal(res, a, b, s);
 }
+int mlx_erf(mlx_array* res, const mlx_array a, const mlx_stream s) {
+  if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return 1; }
+  return mlx_dispatch.mlx_erf(res, a, s);
+}
 int mlx_exp(mlx_array* res, const mlx_array a, const mlx_stream s) {
   if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return 1; }
   return mlx_dispatch.mlx_exp(res, a, s);
+}
+int mlx_fast_layer_norm(mlx_array* res, const mlx_array x, const mlx_array weight , const mlx_array bias , float eps, const mlx_stream s) {
+  if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return 1; }
+  return mlx_dispatch.mlx_fast_layer_norm(res, x, weight, bias, eps, s);
 }
 int mlx_fast_metal_kernel_apply(mlx_vector_array* outputs, mlx_fast_metal_kernel cls, const mlx_vector_array inputs, const mlx_fast_metal_kernel_config config, const mlx_stream stream) {
   if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return 1; }

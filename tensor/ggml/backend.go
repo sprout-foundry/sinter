@@ -3181,6 +3181,29 @@ func (g *GGMLBackend) FastRMSNorm(x, weight tensor.Array, eps float32, s tensor.
 	return g.evalOp(result)
 }
 
+// LayerNorm normalizes over the last axis, then applies weight and bias.
+// ggml_norm does the normalization; the affine part is a mul and an add.
+func (g *GGMLBackend) LayerNorm(x, weight, bias tensor.Array, eps float32, s tensor.Stream) (tensor.Array, error) {
+	ctx := g.ctxPtr()
+	result := C.ggml_norm(ctx, x.(*Array).cTensor(), C.float(eps))
+	if weight != nil {
+		result = C.ggml_mul(ctx, result, weight.(*Array).cTensor())
+	}
+	if bias != nil {
+		result = C.ggml_add(ctx, result, bias.(*Array).cTensor())
+	}
+	return g.evalOp(result)
+}
+
+// GELU applies the erf form or ggml's tanh approximation of GELU.
+func (g *GGMLBackend) GELU(x tensor.Array, exact bool, s tensor.Stream) (tensor.Array, error) {
+	ctx := g.ctxPtr()
+	if exact {
+		return g.evalOp(C.ggml_gelu_erf(ctx, x.(*Array).cTensor()))
+	}
+	return g.evalOp(C.ggml_gelu(ctx, x.(*Array).cTensor()))
+}
+
 // ── tensor.Backend: attention ──────────────────────────────────────
 
 // FastScaledDotProductAttention computes softmax(QK^T*scale + mask) @ V.

@@ -1,100 +1,10 @@
 package vision
 
 import (
-	"bytes"
-	"encoding/binary"
-	"fmt"
 	"math"
 	"os"
 	"testing"
 )
-
-// loadNpyFloat32 reads a C-order little-endian float32 .npy file (the format
-// numpy.save writes) and returns its flat data and shape. Only the subset the
-// test fixtures need is supported.
-func loadNpyFloat32(t *testing.T, path string) ([]float32, []int) {
-	t.Helper()
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
-	}
-	if len(raw) < 10 || !bytes.HasPrefix(raw, []byte("\x93NUMPY")) {
-		t.Fatalf("%s: not a .npy file", path)
-	}
-	major := raw[6]
-	var headerLen int
-	var headerStart int
-	if major == 1 {
-		headerLen = int(binary.LittleEndian.Uint16(raw[8:10]))
-		headerStart = 10
-	} else {
-		headerLen = int(binary.LittleEndian.Uint32(raw[8:12]))
-		headerStart = 12
-	}
-	header := string(raw[headerStart : headerStart+headerLen])
-	dataStart := headerStart + headerLen
-
-	// The header is a Python dict literal: {'descr': '<f4', 'fortran_order': False, 'shape': (1200, 1536), }
-	// Take the value after "'descr':" up to the next quote.
-	descrStart := bytes.Index([]byte(header), []byte("'descr':"))
-	if descrStart < 0 {
-		t.Fatalf("%s: no descr in header %q", path, header)
-	}
-	rest := header[descrStart+len("'descr':"):]
-	q1 := bytes.IndexByte([]byte(rest), '\'')
-	if q1 < 0 {
-		t.Fatalf("%s: unterminated descr in header %q", path, header)
-	}
-	q2 := bytes.IndexByte([]byte(rest[q1+1:]), '\'')
-	if q2 < 0 {
-		t.Fatalf("%s: unterminated descr in header %q", path, header)
-	}
-	descr := rest[q1+1 : q1+1+q2]
-	if descr != "<f4" {
-		t.Fatalf("%s: unsupported dtype %q, want <f4", path, descr)
-	}
-
-	var shape []int
-
-	// Shape lives between '(' and ')'.
-	open := bytes.IndexByte([]byte(header), '(')
-	close := bytes.IndexByte([]byte(header), ')')
-	if open < 0 || close < 0 || close < open {
-		t.Fatalf("%s: no shape in header %q", path, header)
-	}
-	for _, f := range bytes.Split([]byte(header[open+1:close]), []byte(",")) {
-		f = bytes.TrimSpace(f)
-		if len(f) == 0 {
-			continue
-		}
-		var n int
-		if _, err := fmt.Sscanf(string(f), "%d", &n); err != nil {
-			t.Fatalf("%s: parse shape field %q: %v", path, f, err)
-		}
-		shape = append(shape, n)
-	}
-
-	total := 1
-	for _, d := range shape {
-		total *= d
-	}
-	payload := raw[dataStart:]
-	if len(payload) != total*4 {
-		t.Fatalf("%s: payload %d bytes, want %d", path, len(payload), total*4)
-	}
-	out := make([]float32, total)
-	for i := range out {
-		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(payload[i*4:]))
-	}
-	return out, shape
-}
-
-func trimQuotes(s string) string {
-	for len(s) > 0 && (s[len(s)-1] == '\'' || s[len(s)-1] == '"') {
-		s = s[:len(s)-1]
-	}
-	return s
-}
 
 // TestPreprocessMatchesReference compares the full preprocessing pipeline
 // against a fixture produced by the model's own image processor
@@ -108,7 +18,10 @@ func trimQuotes(s string) string {
 // drift (max 0.0079 on a [-1,1] range). A no-resize image matches bit-exactly;
 // see TestPreprocessNoResizeIsExact.
 func TestPreprocessMatchesReference(t *testing.T) {
-	want, shape := loadNpyFloat32(t, "testdata/ref_96.npy")
+	want, shape, err := LoadNpyFloat32("testdata/ref_96.npy")
+	if err != nil {
+		t.Fatalf("load reference: %v", err)
+	}
 	if len(shape) != 2 || shape[1] != 1536 {
 		t.Fatalf("fixture shape %v, want [N 1536]", shape)
 	}

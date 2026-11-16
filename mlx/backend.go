@@ -269,6 +269,21 @@ func (b *MetalBackend) FastRMSNorm(x, weight tensor.Array, eps float32, s tensor
 	return FastRMSNorm(x.(*Array), w, eps, toStream(s))
 }
 
+func (b *MetalBackend) LayerNorm(x, weight, bias tensor.Array, eps float32, s tensor.Stream) (tensor.Array, error) {
+	var w, bi *Array
+	if weight != nil {
+		w = weight.(*Array)
+	}
+	if bias != nil {
+		bi = bias.(*Array)
+	}
+	return LayerNorm(x.(*Array), w, bi, eps, toStream(s))
+}
+
+func (b *MetalBackend) GELU(x tensor.Array, exact bool, s tensor.Stream) (tensor.Array, error) {
+	return GELU(x.(*Array), exact, toStream(s))
+}
+
 func (b *MetalBackend) FastScaledDotProductAttention(q, k, v tensor.Array, scale float32, maskMode string, maskArr, sinks tensor.Array, s tensor.Stream) (tensor.Array, error) {
 	var ma, sa *Array
 	if maskArr != nil {

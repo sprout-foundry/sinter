@@ -15,6 +15,7 @@ import "C"
 
 import (
 	"fmt"
+	"math"
 	"unsafe"
 )
 
@@ -59,6 +60,98 @@ func FastRMSNorm(x, weight *Array, eps float32, s *Stream) (*Array, error) {
 	}
 	rc := C.mlx_fast_rms_norm(&out, x.cHandle(), w, C.float(eps), s.cHandle())
 	return wrapResult(out, rc, "fast_rms_norm")
+}
+
+// LayerNorm applies fused LayerNorm over the last axis:
+// (x-mean)/sqrt(var+eps)*weight + bias. weight and bias may be nil.
+func LayerNorm(x, weight, bias *Array, eps float32, s *Stream) (*Array, error) {
+	out := newOutput()
+	var w, b C.mlx_array
+	if weight != nil {
+		w = weight.cHandle()
+	}
+	if bias != nil {
+		b = bias.cHandle()
+	}
+	rc := C.mlx_fast_layer_norm(&out, x.cHandle(), w, b, C.float(eps), s.cHandle())
+	return wrapResult(out, rc, "fast_layer_norm")
+}
+
+// GELU applies the Gaussian error linear unit.
+//
+// exact selects the erf form, 0.5*x*(1+erf(x/sqrt(2))), which is what
+// nn.GELU computes. Otherwise it uses the tanh approximation,
+// 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3))), which is
+// gelu_pytorch_tanh. MLX exposes neither as one op, so both are built from
+// elementwise primitives; the graph stays lazy and fuses at eval.
+func GELU(x *Array, exact bool, s *Stream) (*Array, error) {
+	half := newScalarFloat32(0.5)
+	defer half.Free()
+	one := newScalarFloat32(1.0)
+	defer one.Free()
+
+	var inner *Array
+	if exact {
+		invSqrt2 := newScalarFloat32(float32(1.0 / math.Sqrt2))
+		defer invSqrt2.Free()
+		scaled, err := Multiply(x, invSqrt2, s)
+		if err != nil {
+			return nil, fmt.Errorf("gelu scale: %w", err)
+		}
+		defer scaled.Free()
+		inner, err = Erf(scaled, s)
+		if err != nil {
+			return nil, fmt.Errorf("gelu erf: %w", err)
+		}
+	} else {
+		coef := newScalarFloat32(0.044715)
+		defer coef.Free()
+		x2, err := Multiply(x, x, s)
+		if err != nil {
+			return nil, fmt.Errorf("gelu x^2: %w", err)
+		}
+		defer x2.Free()
+		x3, err := Multiply(x2, x, s)
+		if err != nil {
+			return nil, fmt.Errorf("gelu x^3: %w", err)
+		}
+		defer x3.Free()
+		cx3, err := Multiply(x3, coef, s)
+		if err != nil {
+			return nil, fmt.Errorf("gelu coef: %w", err)
+		}
+		defer cx3.Free()
+		sum, err := Add(x, cx3, s)
+		if err != nil {
+			return nil, fmt.Errorf("gelu sum: %w", err)
+		}
+		defer sum.Free()
+		sqrt2OverPi := newScalarFloat32(float32(math.Sqrt(2.0 / math.Pi)))
+		defer sqrt2OverPi.Free()
+		scaled, err := Multiply(sum, sqrt2OverPi, s)
+		if err != nil {
+			return nil, fmt.Errorf("gelu scale: %w", err)
+		}
+		defer scaled.Free()
+		inner, err = Tanh(scaled, s)
+		if err != nil {
+			return nil, fmt.Errorf("gelu tanh: %w", err)
+		}
+	}
+	defer inner.Free()
+
+	// 0.5 * x * (1 + inner)
+	onePlus, err := Add(inner, one, s)
+	if err != nil {
+		return nil, fmt.Errorf("gelu 1+: %w", err)
+	}
+	defer onePlus.Free()
+	hx, err := Multiply(x, half, s)
+	if err != nil {
+		return nil, fmt.Errorf("gelu half: %w", err)
+	}
+	defer hx.Free()
+	return Multiply(hx, onePlus, s)
 }
 
 // FastRoPE applies fused rotary position embeddings.

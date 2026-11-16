@@ -251,6 +251,60 @@ func (sf *SafetensorsFile) Get(name string, b tensor.Backend, s tensor.Stream) (
 	return b.NewArrayFromBytes(rawBytes, entry.Shape, dtype)
 }
 
+// GetReshaped loads a tensor as an array with the given element shape,
+// ignoring the shape recorded in the file. The element count must match.
+//
+// This exists for weights whose stored rank exceeds what a backend can
+// represent: ggml caps tensors at 4 dimensions, so a 5-D Conv3d kernel has
+// to be flattened as it is read.
+func (sf *SafetensorsFile) GetReshaped(name string, shape []int, b tensor.Backend, s tensor.Stream) (tensor.Array, error) {
+	if sf.weightMap != nil {
+		shardFile, ok := sf.weightMap[name]
+		if !ok {
+			return nil, fmt.Errorf("safetensors: key %q not found in shard index", name)
+		}
+		shard, ok := sf.shards[shardFile]
+		if !ok {
+			return nil, fmt.Errorf("safetensors: shard %q for %q not loaded", shardFile, name)
+		}
+		return shard.GetReshaped(name, shape, b, s)
+	}
+
+	entry, ok := sf.header[name]
+	if !ok {
+		return nil, fmt.Errorf("safetensors: key %q not found", name)
+	}
+	total := 1
+	for _, d := range entry.Shape {
+		total *= d
+	}
+	want := 1
+	for _, d := range shape {
+		want *= d
+	}
+	if total != want {
+		return nil, fmt.Errorf("safetensors: %q has %d elements, reshape %v needs %d", name, total, shape, want)
+	}
+
+	var dtype tensor.Dtype
+	switch entry.DType {
+	case "BF16":
+		dtype = tensor.BFloat16
+	case "F16":
+		dtype = tensor.Float16
+	case "F32":
+		dtype = tensor.Float32
+	case "U32":
+		dtype = tensor.UInt32
+	case "I32":
+		dtype = tensor.Int32
+	default:
+		return nil, fmt.Errorf("safetensors: %q has unsupported dtype %s", name, entry.DType)
+	}
+
+	return b.NewArrayFromBytes(sf.rawData[entry.DataOffsets[0]:entry.DataOffsets[1]], shape, dtype)
+}
+
 // Has reports whether a tensor exists in the file (or any shard).
 func (sf *SafetensorsFile) Has(name string) bool {
 	if sf.weightMap != nil {

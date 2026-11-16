@@ -170,6 +170,16 @@ type Backend interface {
 	Softmax(a Array, s Stream) (Array, error)
 	SoftmaxAxis(a Array, axis int, s Stream) (Array, error)
 	FastRMSNorm(x, weight Array, eps float32, s Stream) (Array, error)
+	// LayerNorm normalizes over the last axis with mean subtraction, then
+	// scales by weight and shifts by bias: (x-mean)/sqrt(var+eps)*weight+bias.
+	// weight and bias may be nil. Distinct from FastRMSNorm, which has no
+	// mean subtraction and no bias.
+	LayerNorm(x, weight, bias Array, eps float32, s Stream) (Array, error)
+	// GELU applies the Gaussian error linear unit. exact selects the erf
+	// form (nn.GELU) over the tanh approximation (gelu_pytorch_tanh); the
+	// two differ in the last few bits and some models use both in different
+	// places, so the caller picks.
+	GELU(x Array, exact bool, s Stream) (Array, error)
 
 	// Attention
 	FastScaledDotProductAttention(q, k, v Array, scale float32, maskMode string, maskArr, sinks Array, s Stream) (Array, error)

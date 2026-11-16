@@ -153,6 +153,12 @@ func (b *stubBackend) SoftmaxAxis(tensor.Array, int, tensor.Stream) (tensor.Arra
 func (b *stubBackend) FastRMSNorm(tensor.Array, tensor.Array, float32, tensor.Stream) (tensor.Array, error) {
 	return nil, errUnavailable
 }
+func (b *stubBackend) LayerNorm(tensor.Array, tensor.Array, tensor.Array, float32, tensor.Stream) (tensor.Array, error) {
+	return nil, errUnavailable
+}
+func (b *stubBackend) GELU(tensor.Array, bool, tensor.Stream) (tensor.Array, error) {
+	return nil, errUnavailable
+}
 func (b *stubBackend) FastScaledDotProductAttention(tensor.Array, tensor.Array, tensor.Array, float32, string, tensor.Array, tensor.Array, tensor.Stream) (tensor.Array, error) {
 	return nil, errUnavailable
 }

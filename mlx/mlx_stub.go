@@ -188,6 +188,12 @@ func ArgMax(a *Array, keepdims bool, s *Stream) (*Array, error) {
 func FastRMSNorm(x, weight *Array, eps float32, s *Stream) (*Array, error) {
 	return nil, errUnavailable
 }
+func LayerNorm(x, weight, bias *Array, eps float32, s *Stream) (*Array, error) {
+	return nil, errUnavailable
+}
+func GELU(x *Array, exact bool, s *Stream) (*Array, error) {
+	return nil, errUnavailable
+}
 func FastRoPE(x *Array, dims int, traditional bool, base float64, scale float32, offset int, freqs *Array, s *Stream) (*Array, error) {
 	return nil, errUnavailable
 }
