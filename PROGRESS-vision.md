@@ -243,6 +243,27 @@ So the harness's *vision tower* dumps are usable and its *generated text* and
 against those unusable values and should be read as "the reference is wrong
 here", not as sinter diverging.
 
+## Image token budget
+
+Image cost is capped per request. `DefaultImageMaxTokens` (1024) lowers the
+pixel budget `smart_resize` already enforces, so a large screenshot is
+resized down before patchifying rather than truncated. `New` installs it, and
+a caller with a bigger model can raise `Server.ImageMaxTokens`.
+
+The measurements behind 1024, on a 1080x2340 screenshot:
+
+| image tokens | 2B prefill | 2B answer | 4B prefill | 4B answer |
+|---|---|---|---|---|
+| 2482 | 4517ms | degenerate | 7152ms | correct |
+| 987 | 1369ms | correct | 2371ms | correct |
+| 495 | 652ms | correct | 1357ms | correct |
+| 230 | 335ms | correct | 714ms | correct |
+| 112 | 181ms | correct | 461ms | correct |
+
+The cap sits where the weakest supported model stays coherent, not where the
+largest is fastest: the 2B collapses into a repeated character loop above
+roughly a thousand tokens, while the 4B reads 2482 correctly.
+
 ## Verified commands
 
 ```bash
