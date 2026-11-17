@@ -193,12 +193,22 @@ func (sf *SafetensorsFile) HeaderMetadata() map[string]string {
 	return sf.meta
 }
 
-// TensorShape reports the stored shape of a tensor (empty when the tensor is
-// absent, including for sharded models — the shard headers are consulted
-// lazily on Get). Used by the LoRA loader to size its adapter A/B matrices.
+// TensorShape reports the stored shape of a tensor, or nil when it is absent.
+// For a sharded model this consults the owning shard's header, so callers that
+// size an array from a weight's shape work the same whether the checkpoint is
+// one file or many. Used by the LoRA loader to size its adapter A/B matrices,
+// and by the vision tower to validate the patch-embed kernel.
 func (sf *SafetensorsFile) TensorShape(name string) []int {
 	if sf.weightMap != nil {
-		return nil
+		shardFile, ok := sf.weightMap[name]
+		if !ok {
+			return nil
+		}
+		shard, ok := sf.shards[shardFile]
+		if !ok {
+			return nil
+		}
+		return shard.TensorShape(name)
 	}
 	if entry, ok := sf.header[name]; ok {
 		return entry.Shape
