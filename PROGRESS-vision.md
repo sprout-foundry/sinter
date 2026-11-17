@@ -1,6 +1,6 @@
 # Vision input for sinter — progress
 
-Last updated: 2026-11-16 13:50
+Last updated: 2026-11-17 13:20
 
 ## Status
 
@@ -200,6 +200,48 @@ Concatenation is rare and off the decode path, so the synchronous eval costs
 nothing measurable. `TestImageFeatureCacheMultiImage` is the guard: it checks
 cold, all-cached and mixed multi-image encodes agree bit-for-bit, and it
 fails without the fix.
+
+## Fixed: the merger's biases were never applied
+
+The tower's last step is a 2x2 patch merge: LayerNorm over the tower width,
+concatenate each block's four patches, then two linear layers down to the
+text hidden size. `loadVisionTower` loaded both weights and neither bias, so
+every image reached the language model with a constant offset missing from
+its features.
+
+It degraded rather than broke, which is why it survived. All 24 blocks
+matched the reference at cosine 1.000000; only the merged output was off
+(cosine 0.969, mean absolute 0.012). The committed parity test gates on mean
+absolute difference at 0.03, so the bug sat under the gate and passed.
+
+Found by dumping the reference's per-block hidden states and comparing block
+by block — everything matched until the merger. With both biases applied the
+merged output matches the reference to 2e-4.
+
+The visible effect was image degeneration at larger token counts. On a
+1080x2340 screenshot, 987 image tokens used to collapse into a repeated
+character loop (`C D E F A B C D E F...`); it now transcribes the screen
+correctly. 2482 tokens still degenerates, which looks like the model's own
+limit rather than a missing weight.
+
+`TestMergerAppliesBias` pins the merger with hidden size 1, where LayerNorm
+collapses to zero and the expected output is exact; it fails with either
+bias detached. The parity gate is now 0.015, below the 0.020 this bug
+produced.
+
+## The reference harness is only trustworthy for the tower
+
+Worth knowing before the next parity attempt: the transformers harness in
+`/tmp/sprout` produces degenerate text at *every* image scale — 144, 220,
+406, 495 and 629 tokens — while sinter transcribes the same screenshot
+correctly at 495. Its `lm_head` is properly tied to `embed_tokens`, so the
+output head is not the cause; the text path is broken somewhere else (the
+`linear_attn.conv1d` layout guess in `ref_load.py` is the likely suspect).
+
+So the harness's *vision tower* dumps are usable and its *generated text* and
+*logits* are not. The logit-parity and layer-parity scratch tests compare
+against those unusable values and should be read as "the reference is wrong
+here", not as sinter diverging.
 
 ## Verified commands
 

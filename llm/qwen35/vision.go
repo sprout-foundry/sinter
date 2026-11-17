@@ -30,7 +30,9 @@ type visionTower struct {
 	mergerNormW tensor.Array // [hidden]
 	mergerNormB tensor.Array // [hidden]
 	mergerFC1   *llm.Linear  // hidden*merge^2 -> hidden*merge^2
+	mergerFC1B  tensor.Array // [hidden*merge^2]
 	mergerFC2   *llm.Linear  // hidden*merge^2 -> out_hidden
+	mergerFC2B  tensor.Array // [out_hidden]
 }
 
 // visionBlock is one ViT block. Both LayerNorms carry bias, unlike the
@@ -165,9 +167,17 @@ func loadVisionTower(sf *llm.SafetensorsFile, prefix string, cfg visionConfig, b
 		t.free()
 		return nil, fmt.Errorf("vision merger fc1: %w", err)
 	}
+	if t.mergerFC1B, err = loadBias("merger.linear_fc1"); err != nil {
+		t.free()
+		return nil, fmt.Errorf("vision merger fc1 bias: %w", err)
+	}
 	if t.mergerFC2, err = loadLinear("merger.linear_fc2"); err != nil {
 		t.free()
 		return nil, fmt.Errorf("vision merger fc2: %w", err)
+	}
+	if t.mergerFC2B, err = loadBias("merger.linear_fc2"); err != nil {
+		t.free()
+		return nil, fmt.Errorf("vision merger fc2 bias: %w", err)
 	}
 	return t, nil
 }
@@ -194,7 +204,9 @@ func (t *visionTower) free() {
 	freeArr(t.mergerNormW)
 	freeArr(t.mergerNormB)
 	freeLinear(t.mergerFC1)
+	freeArr(t.mergerFC1B)
 	freeLinear(t.mergerFC2)
+	freeArr(t.mergerFC2B)
 }
 
 func freeLinear(l *llm.Linear) {
@@ -460,9 +472,14 @@ func (t *visionTower) merge(x tensor.Array, numPatches int) (tensor.Array, error
 	}
 	defer flat.Free()
 
-	fc1, err := t.mergerFC1.Forward(flat, b, s)
+	fc1Raw, err := t.mergerFC1.Forward(flat, b, s)
 	if err != nil {
 		return nil, fmt.Errorf("merger fc1: %w", err)
+	}
+	defer fc1Raw.Free()
+	fc1, err := addVectorBias(fc1Raw, t.mergerFC1B, numPatches/(merge*merge), merged, b, s)
+	if err != nil {
+		return nil, fmt.Errorf("merger fc1 bias: %w", err)
 	}
 	defer fc1.Free()
 
@@ -473,7 +490,12 @@ func (t *visionTower) merge(x tensor.Array, numPatches int) (tensor.Array, error
 	}
 	defer act.Free()
 
-	return t.mergerFC2.Forward(act, b, s)
+	outRaw, err := t.mergerFC2.Forward(act, b, s)
+	if err != nil {
+		return nil, fmt.Errorf("merger fc2: %w", err)
+	}
+	defer outRaw.Free()
+	return addVectorBias(outRaw, t.mergerFC2B, numPatches/(merge*merge), cfg.OutHiddenSize, b, s)
 }
 
 // readF32 returns an array's values as float32, casting when the stored

@@ -119,16 +119,15 @@ func TestVisionTowerParityLiveModel(t *testing.T) {
 	}
 
 	// The two implementations agree structurally but not bit-exactly: the
-	// tower's activations grow to ~5e3 by the last block, so f32 reduction
-	// order differences compound to roughly 1% relative by the end. Measured
-	// against the reference with identical input patches: block 0 mean
-	// relative error 2.7e-4, block 11 2.4e-3, block 23 9.9e-3, merged output
-	// mean absolute 0.017 on reference values averaging 0.094.
+	// tower runs in bf16 here while the dump is f32, so accumulation order
+	// compounds through 24 blocks. Measured mean absolute 0.0085 on both MLX
+	// and GGML, on reference values averaging 0.094.
 	//
-	// A layout, position or ordering bug does not look like this — it shows
-	// up as most of the output being wrong at once. So the gate is on the
-	// mean absolute difference, set above the measured drift and well below
-	// what any structural error produces.
+	// The gate sits below what a missing weight or bias produces — the
+	// merger's biases were once skipped, which pushed this to 0.020 — and
+	// above the drift. TestMergerAppliesBias pins the merger directly, so
+	// this only has to catch structural breakage: a layout, position or
+	// ordering bug shows up as most of the output being wrong at once.
 	var maxAbs, sumAbs float64
 	maxRel := 0.0
 	var refAbsMax float64
@@ -151,7 +150,7 @@ func TestVisionTowerParityLiveModel(t *testing.T) {
 	t.Logf("merged output: max abs %.6f, mean abs %.6f, max rel %.4f, reference |max| %.4f",
 		maxAbs, meanAbs, maxRel, refAbsMax)
 
-	const maxMeanAbs = 0.03
+	const maxMeanAbs = 0.015
 	if meanAbs > maxMeanAbs {
 		firstBad := -1
 		for i := range want {
