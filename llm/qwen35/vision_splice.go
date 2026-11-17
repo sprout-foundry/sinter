@@ -5,8 +5,6 @@ package qwen35
 import (
 	"fmt"
 
-	"github.com/sprout-foundry/sinter/llm"
-	"github.com/sprout-foundry/sinter/llm/vision"
 	"github.com/sprout-foundry/sinter/tensor"
 )
 
@@ -100,55 +98,4 @@ func (q *Qwen35) ImageTokens(gridTHW [3]int) int {
 		t = 1
 	}
 	return rows * cols * t
-}
-
-// encodeImages runs the vision tower over each image and concatenates the
-// merged features into one [1, totalTokens, hidden] tensor.
-func (q *Qwen35) encodeImages(pixels []*vision.Pixels, spans []llm.ImageInput) (tensor.Array, error) {
-	s := q.stream
-	b := q.backend
-	hidden := q.cfg.HiddenSize
-
-	var pieces []tensor.Array
-	defer func() {
-		for _, p := range pieces {
-			p.Free()
-		}
-	}()
-
-	for i, px := range pixels {
-		if px == nil {
-			return nil, fmt.Errorf("qwen35: image %d has no pixels", i)
-		}
-		rows := px.NumPatches()
-		cols := len(px.Data) / rows
-		patches, err := b.NewArrayFromFloat32(px.Data, []int{rows, cols})
-		if err != nil {
-			return nil, fmt.Errorf("qwen35: image %d patch array: %w", i, err)
-		}
-		merged, err := q.vision.forward(patches, visionImage{GridTHW: px.GridTHW})
-		patches.Free()
-		if err != nil {
-			return nil, fmt.Errorf("qwen35: image %d tower: %w", i, err)
-		}
-		// The tower returns [tokens, outHidden]; the text model wants
-		// [1, tokens, hidden]. outHidden must equal hidden for the splice.
-		shape := merged.Shape()
-		if len(shape) != 2 || shape[1] != hidden {
-			merged.Free()
-			return nil, fmt.Errorf("qwen35: image %d tower output %v, want [tokens,%d]", i, shape, hidden)
-		}
-		reshaped, err := b.Reshape(merged, []int{1, shape[0], shape[1]}, s)
-		merged.Free()
-		if err != nil {
-			return nil, fmt.Errorf("qwen35: image %d reshape: %w", i, err)
-		}
-		pieces = append(pieces, reshaped)
-	}
-
-	out, err := b.ConcatenateAxis(pieces, 1, s)
-	if err != nil {
-		return nil, fmt.Errorf("qwen35: concatenate image features: %w", err)
-	}
-	return out, nil
 }

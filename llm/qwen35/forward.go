@@ -98,6 +98,10 @@ type Qwen35 struct {
 	// vision_tower.* weights. nil for text-only checkpoints.
 	vision *visionTower
 
+	// featureCache retains the vision tower's merged output per image, so a
+	// repeat image skips the encoder. Created on the first image encode.
+	featureCache *imageFeatureCache
+
 	// imgCos/imgSin hold the per-token rotary tables for an image prefill
 	// chunk. Both nil outside such a chunk, which selects the scalar-offset
 	// fast path in fullAttention.
@@ -396,6 +400,10 @@ func (q *Qwen35) FreeWeights() {
 		q.lastHidden = nil
 	}
 	q.weights.embed.Free()
+	if q.featureCache != nil {
+		q.featureCache.free()
+		q.featureCache = nil
+	}
 	if q.vision != nil {
 		q.vision.free()
 		q.vision = nil

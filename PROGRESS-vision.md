@@ -150,6 +150,39 @@ Still open: nothing on the caching path. A text prompt whose whole prompt
 matches a slot now takes the same route as an image prompt (44ms → 1ms),
 and a growing conversation still uses the delta path.
 
+## Vision tower output is cached per image
+
+The prefix cache skips the *text* prefill for a repeated prompt, but a new
+question about an image already seen still re-ran the vision tower. The
+tower's output depends only on the prepared pixels, so `imageFeatureCache`
+in `llm/qwen35/vision_cache.go` keys it on `vision.Pixels.Hash` — patch grid
+plus every pixel value — and an 8-entry LRU serves repeat images.
+
+Measured on MLX (`Qwen3.5-2B-4bit`), a 1024x768 image (3072 patches, 768
+tokens), distinct prompt text each turn so the prefix slot cannot help:
+
+| | request | prefill |
+|---|---|---|
+| tower re-run | 1.26s | ~0.98s |
+| tower cached | 0.70s | ~0.42s |
+
+The tower alone is 510ms at that size (24 blocks × ~48ms; GGML 2.9s).
+
+**Entries are host-side float32, not backend arrays.** Holding a retained
+GPU array across calls is not safe on GGML: `registerArray` keys the
+tensor→Array registry on the C tensor pointer, so `RetainArray` overwrites
+the original wrapper's entry and freeing the original deletes it, leaving
+the retained wrapper pointing at a tensor with no registered logical shape.
+A later `Reshape` then computes element counts from a stale shape and
+`ggml_reshape_1d` aborts. Keeping the values on the host costs one upload
+(~6MB) per hit, which is negligible next to the encoder it replaces.
+
+`TestImageFeatureCacheSkipsTower` asserts both halves — the features match a
+fresh encode bit-for-bit, and the warm call is at least 4x faster — because
+a cache that returned wrong features would still look fast and one that
+silently missed would still return correct features. Verified to fail with
+`SINTER_VISION_CACHE_SIZE=0` (525ms vs 561ms cold).
+
 ## Verified commands
 
 ```bash
@@ -162,6 +195,10 @@ SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/Qwen3.5-2B-
 # GGML (run serially — see below)
 SINTER_BACKEND=ggml SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.5-2b-4bit \
   go test -count=1 -tags ggml ./llm/vision/ ./llm/mropeparity/ ./llm/openaisserver/
+
+# Vision tower feature cache: the warm call must skip the encoder
+SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/Qwen3.5-2B-4bit \
+  go test -count=1 -run TestImageFeatureCacheSkipsTower -v ./llm/qwen35/
 ```
 
 ## Pre-existing failures (not caused by this work)
@@ -173,8 +210,9 @@ SINTER_BACKEND=ggml SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.5-2b-4
   multi-package `-tags ggml` run reports unrelated packages as FAIL when it
   fires; run packages individually to see real results.
 - `TestImageCacheKeyLiveModel` on GGML — intermittently faults in
-  `ggml_reshape` during a repeated image prefill. Clean HEAD crashes at the
-  same rate, and it reproduces with prefix-slot storage disabled entirely,
-  so it is not the cache. Re-run to get a verdict.
+  `ggml_reshape_1d` during a repeated image prefill. Clean HEAD crashes at
+  the same rate (9/14 pass vs 10/14 with the feature cache), and it
+  reproduces with the feature cache disabled entirely, so it is not the
+  cache. Re-run to get a verdict.
 - `TestDeltaKernelByteIdentity`, `TestDeltaKernelNilState`,
   `TestCPUQuantFastPaths` in `tensor/ggml` — fail identically on HEAD.
