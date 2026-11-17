@@ -295,6 +295,15 @@ SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/Qwen3.5-2B-
   the same rate (9/14 pass vs 10/14 with the feature cache), and it
   reproduces with the feature cache disabled entirely, so it is not the
   cache. Re-run to get a verdict.
+- Large image prefills on GGML abort. A 987-token image through the HTTP
+  path dies in `gatedDeltaNet.forward`'s `z` reshape
+  (`GGML_ASSERT(ggml_nelements(a) == ggml_nelements(b))`), and with
+  `SINTER_GGML_DEBUG=1` set it instead fails earlier in the prefix snapshot
+  (`pin of 16777216 bytes exceeds tensor nbytes 73728`). Two different
+  failure modes on the same input says the GGML path is unstable at this
+  length rather than wrong in one place. Small images are fine — the 96px
+  fixture passes — and the same 987-token request is correct on MLX. Not
+  caused by the token cap: it changes the image size, not the text path.
 - `TestDeltaKernelByteIdentity`, `TestDeltaKernelNilState`,
   `TestCPUQuantFastPaths` in `tensor/ggml` — fail identically on HEAD.
 
