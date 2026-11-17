@@ -183,6 +183,24 @@ a cache that returned wrong features would still look fast and one that
 silently missed would still return correct features. Verified to fail with
 `SINTER_VISION_CACHE_SIZE=0` (525ms vs 561ms cold).
 
+## Fixed: batched GGML concatenation returned garbage
+
+Writing the multi-image cache test surfaced a pre-existing backend bug.
+`GGMLBackend.ConcatenateAxis` chained `ggml_concat` nodes in the recyclable
+ops context, then queued the result under batched evaluation. A flush
+triggered by a later op recycles that context, so the queued graph read freed
+nodes — and a multi-image vision encode returned raw patch data instead of
+merged features. Single-image encodes never concatenate, which is why this
+went unnoticed; it reproduces on HEAD (2 images, batched GGML, every value
+wrong) and disappears with `SINTER_GGML_BATCH=0`.
+
+`ConcatenateAxis` now flushes pending ops and evaluates through
+`evalOpEager`, so the chain runs before anything can recycle its nodes.
+Concatenation is rare and off the decode path, so the synchronous eval costs
+nothing measurable. `TestImageFeatureCacheMultiImage` is the guard: it checks
+cold, all-cached and mixed multi-image encodes agree bit-for-bit, and it
+fails without the fix.
+
 ## Verified commands
 
 ```bash
@@ -216,3 +234,9 @@ SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/Qwen3.5-2B-
   cache. Re-run to get a verdict.
 - `TestDeltaKernelByteIdentity`, `TestDeltaKernelNilState`,
   `TestCPUQuantFastPaths` in `tensor/ggml` — fail identically on HEAD.
+
+## Fixed along the way
+
+- `GGMLBackend.ConcatenateAxis` returned garbage for inputs that were still
+  pending under batched evaluation (see above). Found by the multi-image
+  feature-cache test; it affected every multi-image vision prefill on GGML.

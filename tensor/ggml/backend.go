@@ -1971,6 +1971,14 @@ func (g *GGMLBackend) evalOp(opResult *C.struct_ggml_tensor) (*Array, error) {
 	if batchEnabled {
 		return g.enqueueOp(opResult)
 	}
+	return g.evalOpEager(opResult)
+}
+
+// evalOpEager builds, allocates and computes a single-op graph now, copying
+// the result into a fresh leaf the returned Array owns. Callers that must not
+// defer — multi-node chains whose intermediate nodes live in the recyclable
+// ops context — use this directly.
+func (g *GGMLBackend) evalOpEager(opResult *C.struct_ggml_tensor) (*Array, error) {
 	// Build the graph in a TEMPORARY context. Graphs are ~64KB each and
 	// accumulate in the main context arena, eventually corrupting tensor
 	// metadata. By using a temp context, we keep the main arena clean for
@@ -2914,7 +2922,6 @@ func (g *GGMLBackend) SliceUpdate(src, update tensor.Array, start, stop []int, s
 }
 
 func (g *GGMLBackend) ConcatenateAxis(arrays []tensor.Array, axis int, s tensor.Stream) (tensor.Array, error) {
-	ctx := g.ctxPtr()
 	if len(arrays) == 0 {
 		return nil, fmt.Errorf("ggml: concatenate requires at least one array")
 	}
@@ -2924,9 +2931,24 @@ func (g *GGMLBackend) ConcatenateAxis(arrays []tensor.Array, axis int, s tensor.
 	ggmlAxis := ggmlAxisIndex(nd, axis)
 	result := arrays[0].(*Array).cTensor()
 	for _, a := range arrays[1:] {
-		result = C.ggml_concat(ctx, result, a.(*Array).cTensor(), C.int(ggmlAxis))
+		result = C.ggml_concat(g.ctxPtr(), result, a.(*Array).cTensor(), C.int(ggmlAxis))
 	}
-	out, err := g.evalOp(result)
+
+	// Evaluate eagerly rather than queueing. The chain above is a multi-node
+	// graph whose leaves are the caller's arrays, and under batched
+	// evaluation a flush triggered by a later op recycles the ops context
+	// these nodes live in before the graph referencing them runs — so the
+	// queued concat reads freed nodes and returns garbage (observed as
+	// patch data instead of features on a multi-image vision encode).
+	// Concatenation is rare and off the decode hot path, so paying for a
+	// synchronous eval here costs nothing measurable and removes the hazard.
+	//
+	// Flush first so the inputs are materialised leaves, then run this one
+	// op through the eager path.
+	if err := g.flush(); err != nil {
+		return nil, err
+	}
+	out, err := g.evalOpEager(result)
 	if err != nil {
 		return nil, err
 	}
