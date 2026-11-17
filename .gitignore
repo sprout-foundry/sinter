@@ -1,1 +1,4 @@
 .sprout/
+
+# Scratch diagnostics: throwaway tests, kept out of history.
+zz_*_test.go
