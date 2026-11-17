@@ -119,6 +119,41 @@ func TestDecodeRequestImagesEnforcesCount(t *testing.T) {
 	}
 }
 
+// TestDecodeRequestImagesAppliesTokenCap checks the per-image token budget.
+// A 512x512 image is 256 merged tokens uncapped; with the cap at 128 it must
+// come back resized to fit, not truncated.
+func TestDecodeRequestImagesAppliesTokenCap(t *testing.T) {
+	url := pngDataURL(t, 512, 512)
+	msgs := []chatMessage{{Content: messageContent{Images: []string{url}}}}
+
+	uncapped := &Server{}
+	got, err := uncapped.decodeRequestImages(msgs)
+	if err != nil {
+		t.Fatalf("uncapped: %v", err)
+	}
+	if n := got[0].NumTokens(); n <= 128 {
+		t.Fatalf("uncapped image is %d tokens, expected more than the 128 cap", n)
+	}
+
+	capped := &Server{ImageMaxTokens: 128}
+	got, err = capped.decodeRequestImages(msgs)
+	if err != nil {
+		t.Fatalf("capped: %v", err)
+	}
+	if n := got[0].NumTokens(); n > 128 {
+		t.Errorf("capped image is %d tokens, want at most 128", n)
+	}
+}
+
+// TestNewSetsImageTokenCap keeps the default wired for callers that never
+// touch the field — sprout builds its server through New.
+func TestNewSetsImageTokenCap(t *testing.T) {
+	s := New(nil, "test", 0)
+	if s.ImageMaxTokens != DefaultImageMaxTokens {
+		t.Errorf("ImageMaxTokens = %d, want %d", s.ImageMaxTokens, DefaultImageMaxTokens)
+	}
+}
+
 // TestDecodeRequestImagesNoneIsNil keeps the text-only path allocation-free.
 func TestDecodeRequestImagesNoneIsNil(t *testing.T) {
 	s := &Server{}

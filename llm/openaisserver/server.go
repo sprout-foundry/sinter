@@ -175,13 +175,22 @@ type Server struct {
 	// (0 = no cap). Prevents a connection-check or runaway request from
 	// generating thousands of tokens on a RAM-constrained machine.
 	MaxTokensCap int
-	mu           sync.Mutex // serializes generation (single GPU model, one request at a time)
+	// ImageMaxTokens caps the <|image_pad|> tokens one image may expand to
+	// (0 = no cap). New sets it to DefaultImageMaxTokens; raise it for a
+	// model that stays coherent on larger images.
+	ImageMaxTokens int
+	mu             sync.Mutex // serializes generation (single GPU model, one request at a time)
 }
 
 // New creates a Server for the given model. modelName is what /v1/models and
 // /health report (e.g. "qwen3_5_text-local-2560-32").
 func New(model Model, modelName string, maxTokensCap int) *Server {
-	return &Server{model: model, modelName: modelName, MaxTokensCap: maxTokensCap}
+	return &Server{
+		model:          model,
+		modelName:      modelName,
+		MaxTokensCap:   maxTokensCap,
+		ImageMaxTokens: DefaultImageMaxTokens,
+	}
 }
 
 // Handler returns an http.Handler with the standard routes mounted.

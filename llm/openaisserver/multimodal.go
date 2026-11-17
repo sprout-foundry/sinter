@@ -21,6 +21,22 @@ const MaxImageBytes = 4 << 20
 // memory risk on a machine sized for one model.
 const MaxImagesPerRequest = 8
 
+// DefaultImageMaxTokens caps how many <|image_pad|> tokens one image may
+// expand to. Both the vision tower and the text prefill scale with it, so it
+// is the main lever on image-request latency: on a 1080x2340 screenshot the
+// 2B model needs 4.5s of prefill at 2482 tokens and 1.4s at 987.
+//
+// It is also a quality ceiling for the small models. Past roughly a thousand
+// image tokens the 2B starts returning a repeated character loop instead of
+// the screen's text, while the 4B still reads it correctly — so the cap is
+// set where the weakest supported model stays coherent, and a caller with a
+// larger model can raise it.
+//
+// The cap resizes the image down before patchifying, which is what the
+// reference processor does with a smaller budget: the model only ever sees a
+// smaller image, never a truncated one.
+const DefaultImageMaxTokens = 1024
+
 // contentPart is one entry of an OpenAI-style multimodal content array.
 // A plain-string content decodes into a single text part.
 type contentPart struct {
@@ -175,9 +191,10 @@ func (s *Server) decodeRequestImages(msgs []chatMessage) ([]*vision.Pixels, erro
 		return nil, fmt.Errorf("request has %d images, the limit is %d", total, MaxImagesPerRequest)
 	}
 	out := make([]*vision.Pixels, 0, total)
+	cfg := vision.DefaultConfig().WithMaxTokens(s.ImageMaxTokens)
 	for _, m := range msgs {
 		for _, url := range m.Content.Images {
-			px, err := decodeDataURL(url, vision.DefaultConfig())
+			px, err := decodeDataURL(url, cfg)
 			if err != nil {
 				return nil, err
 			}

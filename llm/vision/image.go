@@ -29,6 +29,17 @@ type Config struct {
 	LongestEdge       int // max pixel budget (longest_edge)
 	Mean              [3]float32
 	Std               [3]float32
+
+	// MaxTokens caps how many <|image_pad|> tokens one image may expand to.
+	// Zero means no cap beyond LongestEdge.
+	//
+	// The encoder and the text prefill both scale with this, so it is the
+	// main lever on image-request latency: a 1024x768 image is 768 tokens
+	// uncapped and ~0.5s in the tower alone. Lowering it resizes the image
+	// down before patchifying, which is what the reference processor does
+	// when it is given a smaller budget — the model has no notion of a
+	// "capped" image, only of a smaller one.
+	MaxTokens int
 }
 
 // DefaultConfig returns the Qwen3.5 VL preprocessing parameters
@@ -43,6 +54,20 @@ func DefaultConfig() Config {
 		Mean:              [3]float32{0.5, 0.5, 0.5},
 		Std:               [3]float32{0.5, 0.5, 0.5},
 	}
+}
+
+// WithMaxTokens returns a copy of the config that caps one image at n
+// <|image_pad|> tokens (0 removes the cap). It lowers LongestEdge, which is
+// the budget smart_resize already enforces, so no new resize path is needed.
+func (c Config) WithMaxTokens(n int) Config {
+	c.MaxTokens = n
+	if n <= 0 {
+		return c
+	}
+	// One token is one merge group of patch*merge pixels on a side.
+	side := c.PatchSize * c.MergeSize
+	c.LongestEdge = n * side * side
+	return c
 }
 
 // Factor is the divisor the reference rounds both dimensions to: one patch
