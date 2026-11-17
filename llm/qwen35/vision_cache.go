@@ -236,8 +236,6 @@ func (q *Qwen35) cachedPromptFeatures(pixels []*vision.Pixels) (tensor.Array, bo
 	if err != nil {
 		return nil, false
 	}
-	// Hand the caller its own reference; out is released by the defer.
-	retained := q.backend.RetainArray(out)
-	out.Free()
-	return retained, true
+	// Hand the caller its own reference; out itself is released by the defer.
+	return q.backend.RetainArray(out), true
 }
