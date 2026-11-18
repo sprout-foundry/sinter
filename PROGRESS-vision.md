@@ -387,7 +387,7 @@ the eager number is therefore not a bug to fix: with a 95%-busy GPU and a
 hard data dependency between consecutive tokens, there is almost nothing to
 overlap. Do not spend more time here.
 
-**The 2.7ms gap is accounted for by the compiled path's own design costs.**
+**Compiled decode pays 2.4ms of design costs that mlx-lm does not.**
 63 tok/s is 15.9ms/token; mlx-lm's 76 is 13.2ms. The difference:
 
 | cost | per token | why sinter pays it |
@@ -399,15 +399,42 @@ overlap. Do not spend more time here.
 All three are consequences of one decision: compiled decode needs static
 shapes, so the cache cannot be exactly `pos+1` long and cannot be mutated in
 place. mlx-lm avoids all three by never compiling — it slices its cache to
-`offset` and writes the new row host-side. That is the whole 18%: not a
-missing kernel, a different tradeoff.
+`offset` and writes the new row host-side. That covers 2.4ms of the 2.7ms
+gap, but it is not the whole story, because the eager path avoids all three
+too and is slower still.
 
 So closing the gap is not an optimization, it is a choice between two
-designs. The experiment worth running is the one that tests mlx-lm's design
-in sinter: the eager path with an exact-length cache (no mask, no scatter)
-plus async pipelining. If eager-with-exact-cache reaches ~76, the compiled
-path is a net loss on this model and should stop being the default. That is a
-structural change, so measure it before committing to it.
+designs. But note what the eager numbers say, because they cut against the
+obvious conclusion: sinter's **eager** path already uses an exact-length
+window (`AppendWindow` returns a slice to `used`, and `forward.go` passes no
+array mask), so it pays none of the three costs above — and it measures 56
+tok/s, *slower* than compiled's 63. The compiled path pays 2.4ms of design
+costs and still wins by 1.9ms, because compiling the elementwise chain saves
+more than that (2.2ms eager vs 0.4ms compiled).
+
+That leaves a real open question, and it is **not** the cache design. sinter's
+eager path builds one lazy graph per step, flushes the cache updates in a
+single batched `AsyncEvalBatch`, and evals once at the end — the same
+structure as mlx-lm's `_step` + `async_eval`. So the 4.6ms between sinter's
+eager (17.8ms/token) and mlx-lm's eager (13.2ms) is not eval discipline
+either; that hypothesis is ruled out by inspection (`forward.go`, the
+`ForwardDecode` layer loop). It is unattributed, and it is the one number
+worth chasing: if sinter's eager reached mlx-lm's eager, compiled decode
+would be redundant on this model.
+
+Two things to check when the machine is quiet enough to measure (load average
+must be under ~10; it sat between 56 and 103 during this work, which is why
+none of this is resolved):
+
+1. Re-measure mlx-lm and sinter back-to-back on the same prompt, same token
+   count, same greedy settings, so the 18-22% is confirmed under one harness
+   rather than across two. mlx-lm's own reported tok/s and sinter's
+   decode-only harness may not be defined the same way, and that alone could
+   account for part of the difference.
+2. If the gap survives (1), count command buffers per step on each. Same
+   graph, same eval count, different time means the difference is inside the
+   ops — most likely how the quantized matvec is dispatched, not how the
+   step is scheduled.
 
 Per-kernel GPU counters would settle the rest. The Metal System Trace has the
 Shader Timeline disabled and xctrace exposes no option to enable it, so it
