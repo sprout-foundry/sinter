@@ -101,6 +101,15 @@ memcpy-shaped kernel at 75 GB/s. It is fp32 because the checkpoint declares
 `mamba_ssm_dtype: float32`, so halving it to bf16 is a numerics change, not
 a free win.
 
+**First thing to try on the recurrent kernel, before reaching for
+Instruments.** For decode T=1, so the kernel is launch-latency-bound, not
+bandwidth-bound: it launches 1024 threadgroups of 128 threads
+(`SetGrid(32, Dv, B*Hv)`, `SetThreadGroup(32, 4, 1)`) to do ~8 flops each.
+The threadgroup count is the knob — `(32, 8, 1)` or `(32, 16, 1)` cuts it
+4-8x while each thread still owns its own `dv_idx`, so numerics cannot
+change. Verify with token-id equality plus an interleaved A/B on a quiet
+machine (load < 3); this pass could not measure it.
+
 Every block being uniformly 2-5x off its floor is the signature of a
 latency/occupancy problem, not a bytes problem — which is exactly what a
 Metal capture would resolve, and why no host-side restructuring has moved
