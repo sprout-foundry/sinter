@@ -64,25 +64,40 @@ commits its own command buffer — do not trust them for absolute cost.
 - linear attention (30 layers): ~4.5ms, of which ~2.9ms is the projections
   (now merged) and the rest is the recurrent kernel, conv and norms
 - vocabulary head: 2.0ms (286MB, 143 GB/s); argmax over 248k vocab: 0.5ms
+- full attention (10 layers): ~1ms
 - elementwise norms and residual adds: ~0.4ms under compile (2.2ms eager)
 - compiled-closure staging: ~1.5ms (30 recurrent states, 2MB fp32 each,
   crossing the closure boundary in and out every step)
 
-Summing the parts gives ~11.5ms of real work, i.e. a ~87 tok/s ceiling with
-the current kernels. That is why the target below is not reachable by
-rearranging kernels.
+**The 35B is not bandwidth-starved — it is per-layer-overhead-bound.** Per
+layer, on the same machine, compiled decode costs:
 
-**Next lever: the recurrent kernel's parallelism.** `fusedGatedDeltaUpdate`
-launches 32 x-threads per (head, dv) and gives each thread a 4-element serial
-reduction over Dk. In isolation it measures 0.226ms/layer (17.7 GB/s), against
-a 4MB state round-trip that should take ~10µs — but see the caveat above, so
-that number needs an in-situ measurement (Metal capture, or a layer-skip
-ablation) before rewriting the kernel. If it does hold up, the fix is to give
-each thread fewer state elements and reduce across more threads.
+| model | layers | MB/layer | µs/layer | effective GB/s |
+|---|---|---|---|---|
+| Qwen3.5-2B-4bit | 24 | 60 | 296 | 202 |
+| qwen3.5-4b-4bit | 32 | 84 | 394 | 213 |
+| qwen3.6-35b-a3b-4bit | 40 | 42 | 408 | 102 |
 
-**Target.** >100 tok/s on the 35B. At dense-equivalent bandwidth the 35B would
-run at ~120 tok/s; the sum of parts says ~87 with these kernels, so closing
-the rest needs the recurrent kernel and the vocabulary head to get faster, not
+The 35B reads *half* the bytes per layer of the 4B in the *same* time. Its
+decode is set by a ~400µs per-layer cost that barely moves with bytes, times
+40 layers. That is why merging kernels gave 3% rather than the 5x a
+micro-benchmark suggested, and why chasing bandwidth is the wrong frame:
+something per-layer is paying a fixed cost. Two candidates worth a real GPU
+profile (Metal capture, read in Instruments): kernel-to-kernel serialization
+inside each layer, and the MoE's 8-expert `gather_qmm` being internally
+serialized even though its aggregate bandwidth looks fine.
+
+**Micro-benchmark caveat, learned the hard way.** Standalone per-call timings
+on this machine overstate by 3-4x because each `AsyncEval` commits its own
+command buffer, and they also carry a fixed per-run cost that only amortizes
+at high iteration counts: the recurrent kernel measured 0.238ms/layer at 10
+chained iterations, 0.145 at 50, and 0.084 at 200. Always report the iteration
+count, and prefer full-model A/B ablations over isolated timings.
+
+**Target.** >100 tok/s on the 35B. Summing the parts gives ~11.5ms of real
+work, i.e. a ~87 tok/s ceiling with the current kernels, and the per-layer
+table above says the remaining distance is per-layer overhead rather than
+bytes. Reaching 100 needs a GPU profile to find what that ~400µs is, not
 another scheduling change.
 
 **Consumer follow-up.** sprout's `pkg/localmodel/local_provider_chat.go` sets
