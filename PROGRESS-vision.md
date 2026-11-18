@@ -94,6 +94,21 @@ is partly critical-path latency, not work. Use these numbers to rank blocks,
 not to locate a kernel; per-kernel GPU counters are the only thing that
 resolves inside a block.
 
+**The attention block's real GPU work is 266µs, not 530µs.** Chaining the
+actual `compiledFullAttentionLayer` 100 times and evaluating once
+(`TestScratchAttnChain`) — which defeats CSE and amortizes one command-buffer
+commit across the whole chain — gives **266µs per block, 2.66ms per token
+across 10 blocks, 51 GB/s**. So about half of the 5.3ms in-model figure is
+latency, and half is real GPU work that is still 8x off the 400 GB/s floor.
+
+**Per-op isolation does not work at this scale.** Timing each sub-op over 100
+distinct inputs and evaluating each output separately reports 1338µs for
+`q_proj` alone (6 GB/s) — every `Eval` is its own sync point, so the numbers
+are meaningless. The chained-block method above is the only trustworthy
+isolation available without per-kernel counters, and bisecting *within* the
+block therefore needs env-gated variants of the block itself, measured as
+chains.
+
 **This replaces the earlier floor-table estimates, which were wrong by 2-5x**
 and pointed at the wrong blocks. Two in particular:
 
@@ -261,11 +276,11 @@ exactly. See Verified commands.
 already sum to the total, and there is no unaccounted slack to reclaim.
 Getting to 100 means making two blocks faster, in this order:
 
-1. **Full attention — 5.3ms for 136MB (26 GB/s), the worst effective
-   bandwidth in the model.** Every sub-block of it measures near zero, so the
-   block-level number is mostly critical-path latency (see the non-additivity
-   note above) — which means the fix may not be inside attention at all.
-   Per-kernel counters are needed before spending more here.
+1. **Full attention — 2.66ms of real GPU work per token (266µs/block, 51
+   GB/s), plus ~2.6ms of critical-path latency.** The isolated block is 8x
+   off its 400 GB/s floor. Bisecting it needs env-gated variants of the block
+   measured as 100-iteration chains (`TestScratchAttnChain`); per-op timing
+   and in-model sub-ablations both fail here, for the reasons above.
 2. **MoE — 7.6ms for 660MB (87 GB/s).** The largest single block. The
    `gather_qmm` slot sweep above says the call is fixed-cost dominated (k=1
    and k=8 cost the same), so the lever is per-call overhead, not bytes.
@@ -502,6 +517,11 @@ SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b
 # Component cost attribution (scratch, SINTER_ABLATE=attn|moe|delta)
 SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \
   go test -count=1 -run TestScratchAblate -v ./llm/qwen35/
+
+# Chained-block timing (scratch; the only trustworthy isolation without
+# per-kernel counters — 100 chained iterations, one eval)
+SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \
+  go test -count=1 -run TestScratchAttnChain -v ./llm/qwen35/
 
 # K/V buffer capacity sweep (scratch; SINTER_COMPILED_CAPACITY isolates the
 # O(capacity) scatter cost)
