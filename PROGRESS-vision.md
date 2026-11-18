@@ -1,6 +1,6 @@
 # sinter — handoff
 
-Last updated: 2026-11-18 06:05
+Last updated: 2026-11-18 08:25
 
 Vision input works end to end on MLX and GGML, and the bugs that were
 blocking it are fixed and released. This document is the forward plan:
@@ -116,10 +116,23 @@ short context, 58.6/57.2 vs 50.9/50.2 at 2541 tokens (`SINTER_DELTA_OPS=1`
 forces the ops loop). That is the single largest measured win in the decode
 path, and it points the way: the ops loop materializes ~20 intermediates per
 layer over a 2MB state array, so what costs is bytes written to intermediate
-buffers, not launches. Same lesson as the merge experiments. The remaining
-lever is therefore fusing the per-layer norm and elementwise chains (two
-`scaleRMSNorm` plus `rmsNormGated` per DeltaNet layer, 30 layers), not
-removing kernels.
+buffers, not launches.
+
+**Op count on small tensors is free — fusing the norm chains would buy
+nothing.** The obvious next step after the delta result was to fuse the
+per-layer norm and elementwise chains (two `scaleRMSNorm` plus
+`rmsNormGated` per DeltaNet layer, plus the MoE router's ~17 ops). Measured
+instead of assumed: chaining 16 extra exact no-op elementwise ops on each
+layer's output — 640 extra ops per token — measured 63.0 against 64.4 tok/s,
+i.e. nothing. (The first generation with a new op count is slow because MLX
+builds a compile plan for the new graph; ignore it.) A 2048-element bf16
+multiply is ~20ns of memory traffic, so 640 of them is 13µs. The "~2.3µs per
+op" figure in circulation came from a chain over a 2MB tensor and does not
+transfer to the small ones.
+
+So op count is not the lever in general — bytes on the large tensors are.
+That rules out the whole fusion-of-small-chains direction, which is where
+the remaining ops are.
 
 **Steady-state decode, interleaved on a quiet machine** (the earlier
 single-shot numbers were contaminated by the first generation after load,
@@ -182,18 +195,15 @@ count, and prefer full-model A/B ablations over isolated timings.
 
 **Target.** >100 tok/s on the 35B. Summing the measured parts gives ~11.5ms
 of real work, i.e. a ~87 tok/s ceiling with the current kernels. The floor
-table above says where that ceiling comes from: not weight bytes, since
-every block already runs 2-5x off its own bandwidth floor, but the traffic
-each block adds on top — intermediates written and re-read. The fused
-gated-delta kernel's +14% is the proof: it wins by not materializing the
-ops loop's ~20 intermediates, not by launching less.
-
-So the next lever is fusing the per-layer norm and elementwise chains into
-Metal kernels, the way the delta recurrence already is. Per DeltaNet layer
-that is two `scaleRMSNorm` calls plus `rmsNormGated`, across 30 layers, each
-currently a handful of ops over a 2MB activation. That is real kernel work,
-not a scheduling change, and it is the only path left that the measurements
-point at.
+table above says where that ceiling comes from: the large-tensor blocks all
+run 2-5x off their own bandwidth floor. Small-op count is not a factor
+(measured above), so the remaining work is making those kernels saturate
+memory. The two furthest from their floor are the DeltaNet recurrent kernel
+(75 GB/s — a memcpy-shaped kernel over a 2MB fp32 state) and the vocabulary
+head (143 GB/s). Both need a Metal capture read in Instruments to show
+whether the stall is occupancy, dependency serialization or a bad access
+pattern; the ablations available from Go are now exhausted, and each one
+tried has come back negative.
 
 **Consumer follow-up.** sprout's `pkg/localmodel/local_provider_chat.go` sets
 `PromptLookupMaxDrafts = 6` in two places, so production still takes the
@@ -308,6 +318,10 @@ Qwen3.5-2B-4bit, same machine: prefill ~1736 tok/s, decode ~141 tok/s
   55.7/55.3 short, 58.6/57.2 vs 50.9/50.2 at 2541 tokens). The difference is
   what the ops loop writes: ~20 intermediates per layer over a 2MB state
   array. Bytes to intermediate buffers is the lever, launch count is not.
+- **Op count on small tensors** — 640 extra no-op elementwise ops per token
+  (16 per layer) measured 63.0 vs 64.4 tok/s. Free. Fusing the per-layer
+  norm chains or the MoE router would therefore buy nothing; the remaining
+  ops are all on small tensors.
 - **Sampling path** — greedy/no-penalty vs the defaults is identical, so CPU
   argmax over the 248k vocab is not the cost (argmax itself is 0.5ms).
 - **Closure staging** — a 65-input `Closure.Apply` dispatches in 73µs
