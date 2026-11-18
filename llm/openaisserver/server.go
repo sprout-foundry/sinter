@@ -252,12 +252,10 @@ func (s *Server) HandleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg := llm.DefaultGenerateConfig()
-	// Enable speculative decoding for speed (free when the model echoes
-	// context: code, file contents, repetitive patterns). k=6 measured the
-	// best net on agent-style traffic: +30-50% tok/s on echo-heavy
-	// generation (tool output, quoted files) vs k=4, ~5% cost on novel
-	// prose from wasted candidate search.
-	cfg.PromptLookupMaxDrafts = 6
+	// Prompt-lookup speculative decoding is left off: it measured slower
+	// than compiled decode on all three MLX models tried, including
+	// verbatim-echo prompts where it should win (see the usePromptLookup
+	// comment in llm/model.go).
 	if req.MaxTokens != nil && *req.MaxTokens > 0 {
 		cfg.MaxTokens = *req.MaxTokens
 	}

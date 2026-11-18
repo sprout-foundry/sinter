@@ -46,6 +46,12 @@ type Model struct {
 	// without changing Generate's signature.
 	lastPromptMs int64
 
+	// compiledDecodeWarned records that PrepareCompiledDecode has already
+	// failed once for this model, so the fallback warning is logged once
+	// instead of on every generation (compiled decode is default-ON and
+	// always unavailable on non-MLX backends).
+	compiledDecodeWarned bool
+
 	// Thinking-block state. Qwen3.5 emits <think>...</think> before the real
 	// answer when thinking is enabled (the default per its chat template).
 	// shouldFilterToken hides the block from callbacks unless ThinkingTokens
@@ -436,9 +442,13 @@ type GenerateConfig struct {
 	// PromptLookupMaxDrafts enables prompt-lookup speculative decoding.
 	// When >0, the generation loop searches for n-gram matches between the
 	// recent context and the remaining prompt, proposes matching tokens as
-	// candidates, and verifies them in a single batched forward pass. Free
-	// speedup when the model echoes context (code, file contents, patterns).
-	// 0 disables it. Recommended: 4-8.
+	// candidates, and verifies them in a single batched forward pass.
+	// 0 disables it, which is the better default on MLX: measured 106-114
+	// tok/s against 140.9 for compiled decode on Qwen3.5-2B-4bit, and
+	// 45.7-53.8 against 50.4-59.1 on qwen3.6-35b-a3b-4bit, even on
+	// verbatim-echo prompts. The n-gram search finds no candidates on most
+	// steps, so the verify batches and prefix snapshots cost more than the
+	// accepted drafts save.
 	PromptLookupMaxDrafts int
 	// ThinkingTokens determines whether to include <think>...</think> blocks
 	// in the output. When false (default), thinking tokens are filtered.
@@ -870,47 +880,50 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 	// priority over prompt-lookup: both are decode-loop-level throughput
 	// strategies, and combining them would mean materializing tokens
 	// synchronously to search for n-gram candidates, defeating pipelining's
-	// whole point of NOT reading back every step. Pipelining alone recovers
-	// the bulk of the gap against mlx-lm; prompt-lookup on top is future work.
+	// whole point of NOT reading back every step.
 	pipelinedArch, pipelinedOK := m.arch.(PipelinedGreedyArchitecture)
-	// Pipelined decode is default ON where the arch implements it.
-	// SINTER_PIPELINE_DECODE=0 opts out; =1 forces it on.
+	// Pipelined decode is OPT-IN (SINTER_PIPELINE_DECODE=1). It was default
+	// ON, but measured slower than compiled decode on every MLX model tried
+	// — qwen3.6-35b-a3b-4bit 52.6/53.0 vs 58.8/59.1 tok/s, Qwen3.5-2B-4bit
+	// 112.3/116.3 vs 140.9/141.9, qwen3.5-4b-4bit 75.3/75.3 vs 77.8/79.2
+	// (decode-only, greedy, two to four runs each). The overlap it buys is
+	// not additive on MLX: the two in-flight steps contend for the same
+	// bandwidth rather than filling each other's gaps. On GGML it was a wash
+	// (19.6 vs 20.3 tok/s on qwen2.5-0.5b-4bit, Termux aarch64), so the
+	// eager path is no worse there either.
 	//
-	// History: (1) TestPipelinedDecodeParityLiveModel (darwin/MLX) found
-	// pipelined output diverging from plain decode — still open on MLX, so
-	// the MLX default remains OFF until that parity passes. (2) On GGML
-	// (Termux aarch64) the pipelined loop crashed in
-	// ggml_backend_graph_compute and every generated token after the first
-	// was wrong (embedding gather read garbage ids). Root-caused 2026-09:
-	// ggml_argmax yields an I32 tensor, but AsType/reads treated the
-	// sampled id as I64 (and the CPU dup kernel can't cast I32/I64 at all),
-	// so the next step's embedding gather consumed garbage ids. Fixed in
-	// tensor/ggml AsType/Int64Data: I32→I64 widens in Go with an explicit
-	// Eval of the argmax first; gated by
-	// TestPipelinedDecodeParityLiveModelGGML.
+	// While it was default-ON it also preempted compiled decode entirely
+	// (useCompiled requires !usePipelined), which is why the compiled path
+	// measured as dead code.
 	//
-	// Measured throughput (Termux aarch64, qwen2.5-0.5b-4bit, 15 paired
-	// runs interleaved with cooldowns): pipelined median 19.6 tok/s vs
-	// plain 20.3 — a wash. Expected: on GGML the batch-eval mode already
-	// absorbs per-op dispatch, which is the same overhead pipelining
-	// removes; on MLX (lazy graph + async eval) the overlap is additive
-	// rather than redundant, which is where this path was originally won.
-	usePipelined := !imagePrompt && useGPUArgmax && !useMTP && pipelinedOK && genCfg.MaxTokens > 1
-	if v := os.Getenv("SINTER_PIPELINE_DECODE"); v != "" {
-		usePipelined = v == "1" && !imagePrompt // explicit override (default ON; "0" opts out)
+	// History worth keeping: the MLX pipelined loop used to duplicate the
+	// first token (fixed — see the seeding comment in the usePipelined
+	// branch) and on GGML it read garbage embedding ids because argmax
+	// yields I32 while the gather treated ids as I64 (fixed in
+	// tensor/ggml AsType/Int64Data). TestPipelinedDecodeParityLiveModel and
+	// its GGML twin cover both.
+	usePipelined := false
+	if os.Getenv("SINTER_PIPELINE_DECODE") == "1" {
+		usePipelined = !imagePrompt && useGPUArgmax && !useMTP && pipelinedOK && genCfg.MaxTokens > 1
 	}
 	// Compiled decode (CompiledGreedyArchitecture): the whole step runs as
 	// one MLX-compiled graph closure, replaying a cached execution plan
-	// instead of re-walking the ~1500-op graph per token. Opt-in via env;
-	// automatically declined for long contexts: the compiled replay stages
-	// every closure input/output array through the graph, so the
-	// fixed-capacity K/V buffers (2x16 whole buffers, ~1.3GB at 20K
-	// context) cost ~16ms/token of pure staging at long context — measured
-	// (TestSpikeApply65Inputs) and unavoidable under MLX's value-semantics
-	// arrays (TestSpikeCapturedBufferMutation: captured constants freeze
-	// values; SliceUpdate never writes shared storage). Below the cutoff
-	// the CPU graph-walk savings dominate and the path WINS (+14% measured
-	// at ~300-token context); above it eager decode is faster.
+	// instead of re-walking the per-token graph. Default ON; declined above
+	// compiledCtxLimit and on backends without MLX.
+	//
+	// Measured on qwen3.6-35b-a3b-4bit against plain eager decode:
+	// 58.8/59.1 vs 54.4/54.6 tok/s at short context and 50.5/48.8 vs
+	// 43.3/45.7 at 2541 tokens — roughly +8-10%. The win comes from replay,
+	// not from fusion: compile's kernel fusion
+	// (SINTER_COMPILED_DECODE_MODE=fuse) measured 54.8/50.3 and 45.2/45.6,
+	// no better than eager. The closure boundary is not free either — every
+	// step stages all 30 DeltaNet recurrent states (2MB fp32 each) plus the
+	// full-attention K/V buffers in and out — so the staging cost scales
+	// with context and is what compiledCtxLimit exists to bound.
+	//
+	// This path only runs because pipelined decode is now opt-in: while
+	// pipelined was default-ON it preempted compiled entirely, which is why
+	// SINTER_COMPILED_DECODE=0 used to change nothing.
 	compiledArch, compiledOK := m.arch.(CompiledGreedyArchitecture)
 	compiledCtxLimit := 4096
 	if v := os.Getenv("SINTER_COMPILED_DECODE_CTX_LIMIT"); v != "" {
@@ -918,27 +931,23 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 			compiledCtxLimit = n
 		}
 	}
-	// Prompt-lookup speculative decoding takes priority where enabled
-	// (production streaming chat): it can emit up to k+1 tokens per forward
-	// pass — a bigger multiplier than compiled decode's +14%. Both
-	// production callers (local_provider, openaisserver) enable lookup, so
-	// compiled decode currently serves only callers that explicitly opt out
-	// of lookup (benchmarks, parity tests). Default ON below the context
-	// cutoff; SINTER_COMPILED_DECODE=0 opts out. Above the cutoff the path
-	// is declined automatically (staging cost scales with KV size — see the
-	// comment above).
-	// Image prompts step aside from the compiled and prompt-lookup paths.
-	// Both derive absolute positions from the token count (compiled sizes its
-	// buffers from promptLen; prompt-lookup's verify batch reuses one scalar
-	// offset), which a prompt whose 3-D positions diverge from its token count
-	// violates. Image prompts are short and one-shot, so the throughput these
-	// paths buy is not worth the extra position plumbing.
+	// Prompt-lookup speculative decoding (genCfg.PromptLookupMaxDrafts > 0)
+	// is likewise opt-in per call. It emits up to k+1 tokens per forward
+	// pass, but measured slower than compiled decode on a copy-heavy prompt
+	// where it should win: 51.6-53.8 vs 57.8-60.7 tok/s on
+	// qwen3.6-35b-a3b-4bit (k=4 and k=6, rewrite and verbatim echo) and
+	// 106-114 vs 140.9 on Qwen3.5-2B-4bit. Instrumented: 362 of 414 decode
+	// steps found no n-gram candidate at all, so the search, prefix
+	// snapshots and verify batches cost more than the accepted drafts save.
 	usePromptLookup := !imagePrompt && useGPUArgmax && !useMTP && !usePipelined && genCfg.PromptLookupMaxDrafts > 0 && genCfg.MaxTokens > 1
 	useCompiled := !imagePrompt && useGPUArgmax && !useMTP && !usePipelined && !usePromptLookup && compiledOK && genCfg.MaxTokens > 1 &&
 		len(tokenIDs) <= compiledCtxLimit && os.Getenv("SINTER_COMPILED_DECODE") != "0"
 	if useCompiled {
 		if err := compiledArch.PrepareCompiledDecode(len(tokenIDs), genCfg.MaxTokens, cache); err != nil {
-			log.Printf("llm: compiled decode unavailable (%v), falling back to eager", err)
+			if !m.compiledDecodeWarned {
+				m.compiledDecodeWarned = true
+				log.Printf("llm: compiled decode unavailable (%v), falling back to eager", err)
+			}
 			useCompiled = false
 		}
 	}
@@ -1226,9 +1235,6 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 			snap := cache.SnapshotPrefix()
 			verifyIDs := append([]int{nextToken}, candidates...)
 			predictions, err := verifyArch.ForwardPrefillArgmaxAll(verifyIDs, pos, cache)
-			if os.Getenv("SINTER_LOCAL_DEBUG") == "1" {
-				log.Printf("llm: decode step %d: verify path pos=%d candidates=%d elapsed=%.3fs", i, pos, len(candidates), time.Since(stepStart).Seconds())
-			}
 			if err != nil {
 				snap.Free()
 				return fmt.Errorf("prompt-lookup verify: %w", err)
@@ -1243,6 +1249,9 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 				}
 				accepted++
 				newNext = predictions[j+1]
+			}
+			if os.Getenv("SINTER_LOCAL_DEBUG") == "1" {
+				log.Printf("llm: decode step %d: verify pos=%d candidates=%d accepted=%d elapsed=%.3fs", i, pos, len(candidates), accepted, time.Since(stepStart).Seconds())
 			}
 
 			if accepted < len(candidates) {

@@ -113,6 +113,110 @@ func (m *sparseMoeBlock) free() {
 	}
 }
 
+// sharedExpertForward runs the always-on shared expert branch:
+// sigmoid(shared_expert_gate(x)) * shared_expert(x).
+func (m *sparseMoeBlock) sharedExpertForward(xFlat tensor.Array, b tensor.Backend, s tensor.Stream) (tensor.Array, error) {
+	sharedGate, err := m.sharedGateProj.Forward(xFlat, b, s)
+	if err != nil {
+		return nil, fmt.Errorf("moe shared gate: %w", err)
+	}
+	defer sharedGate.Free()
+	sharedUp, err := m.sharedUpProj.Forward(xFlat, b, s)
+	if err != nil {
+		return nil, fmt.Errorf("moe shared up: %w", err)
+	}
+	defer sharedUp.Free()
+	sharedAct, err := llm.SwiGLU(sharedUp, sharedGate, b, s)
+	if err != nil {
+		return nil, fmt.Errorf("moe shared swiglu: %w", err)
+	}
+	defer sharedAct.Free()
+	sharedOut, err := m.sharedDownProj.Forward(sharedAct, b, s)
+	if err != nil {
+		return nil, fmt.Errorf("moe shared down: %w", err)
+	}
+	defer sharedOut.Free()
+
+	sharedGateLogit, err := m.sharedExpertGate.Forward(xFlat, b, s)
+	if err != nil {
+		return nil, fmt.Errorf("moe shared_expert_gate: %w", err)
+	}
+	defer sharedGateLogit.Free()
+	sharedGateSigmoid, err := b.Sigmoid(sharedGateLogit, s)
+	if err != nil {
+		return nil, fmt.Errorf("moe shared sigmoid: %w", err)
+	}
+	defer sharedGateSigmoid.Free()
+	return b.Multiply(sharedGateSigmoid, sharedOut, s)
+}
+
+// router runs the top-k expert selection: softmax over the expert logits,
+// argpartition for the top k, then the selected scores normalized to sum to
+// one. Returns the k expert indices [BS, k] and their normalized weights.
+func (m *sparseMoeBlock) router(xFlat tensor.Array, b tensor.Backend, s tensor.Stream) (tensor.Array, tensor.Array, error) {
+	k := m.numExpertsPerTok
+	BS := xFlat.Shape()[0]
+
+	gates, err := m.gate.Forward(xFlat, b, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("moe gate: %w", err)
+	}
+	defer gates.Free()
+
+	if ps, ok := b.(interface {
+		SoftmaxAxisPrecise(tensor.Array, int, tensor.Stream) (tensor.Array, error)
+	}); ok {
+		gates, err = ps.SoftmaxAxisPrecise(gates, -1, s)
+	} else {
+		gates, err = b.SoftmaxAxis(gates, -1, s)
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("moe softmax: %w", err)
+	}
+	defer gates.Free()
+
+	// argpartition with kth=-k puts the top-k elements at the end of the
+	// axis (verified against MLX: argpartition(-3) on a 10-expert row
+	// returns the top-3 in the last 3 slots). Slice the LAST k indices.
+	partIdx, err := b.ArgPartitionAxis(gates, -k, -1, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("moe argpartition: %w", err)
+	}
+	defer partIdx.Free()
+
+	numExperts := gates.Shape()[1]
+	inds, err := b.Slice(partIdx, []int{0, numExperts - k}, []int{BS, numExperts}, []int{1, 1}, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("moe slice indices: %w", err)
+	}
+
+	scores, err := b.TakeAlongAxis(gates, inds, -1, s)
+	if err != nil {
+		inds.Free()
+		return nil, nil, fmt.Errorf("moe take_along_axis: %w", err)
+	}
+
+	// Qwen3-MoE always normalizes the top-k router scores (softmax top-k
+	// weights sum to < 1; the reference divides by their sum so the routed
+	// branch keeps the shared branch's scale). mlx-lm qwen3_moe.py does
+	// this unconditionally — norm_topk_prob in config is a Gemma-style flag
+	// this family does not set.
+	scoreSum, err := b.Sum(scores, []int{-1}, true, s)
+	if err != nil {
+		inds.Free()
+		scores.Free()
+		return nil, nil, fmt.Errorf("moe score sum: %w", err)
+	}
+	defer scoreSum.Free()
+	normalized, err := b.Divide(scores, scoreSum, s)
+	scores.Free()
+	if err != nil {
+		inds.Free()
+		return nil, nil, fmt.Errorf("moe score norm: %w", err)
+	}
+	return inds, normalized, nil
+}
+
 // forward runs the MoE MLP with proper top-k routing.
 //
 //  1. gates = softmax(gate(x))              [B, S, num_experts]
@@ -138,102 +242,19 @@ func (m *sparseMoeBlock) forward(x tensor.Array, q *Qwen35) (tensor.Array, error
 	BS := xFlat.Shape()[0]
 
 	// --- Router ---
-	gates, err := m.gate.Forward(xFlat, b, s)
+	inds, scores, err := m.router(xFlat, b, s)
 	if err != nil {
-		return nil, fmt.Errorf("moe gate: %w", err)
-	}
-	defer gates.Free()
-
-	if ps, ok := b.(interface {
-		SoftmaxAxisPrecise(tensor.Array, int, tensor.Stream) (tensor.Array, error)
-	}); ok {
-		gates, err = ps.SoftmaxAxisPrecise(gates, -1, s)
-	} else {
-		gates, err = b.SoftmaxAxis(gates, -1, s)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("moe softmax: %w", err)
-	}
-	defer gates.Free()
-
-	// --- Top-k expert selection ---
-	// argpartition with kth=-k puts the top-k elements at the end of the
-	// axis (verified against MLX: argpartition(-3) on a 10-expert row
-	// returns the top-3 in the last 3 slots). Slice the LAST k indices.
-	partIdx, err := b.ArgPartitionAxis(gates, -k, -1, s)
-	if err != nil {
-		return nil, fmt.Errorf("moe argpartition: %w", err)
-	}
-	defer partIdx.Free()
-
-	numExperts := gates.Shape()[1]
-	inds, err := b.Slice(partIdx, []int{0, numExperts - k}, []int{BS, numExperts}, []int{1, 1}, s)
-	if err != nil {
-		return nil, fmt.Errorf("moe slice indices: %w", err)
+		return nil, err
 	}
 	defer inds.Free()
-
-	// Gather the corresponding scores
-	scores, err := b.TakeAlongAxis(gates, inds, -1, s)
-	if err != nil {
-		return nil, fmt.Errorf("moe take_along_axis: %w", err)
-	}
 	defer scores.Free()
 
-	// Normalize: Qwen3-MoE always normalizes the top-k router scores
-	// (softmax top-k weights sum to < 1; the reference divides by their
-	// sum so the routed branch keeps the shared branch's scale). mlx-lm
-	// qwen3_moe.py does this unconditionally — norm_topk_prob in config
-	// is a Gemma-style flag this family does not set.
-	scoreSum, err := b.Sum(scores, []int{-1}, true, s)
-	if err != nil {
-		return nil, fmt.Errorf("moe score sum: %w", err)
-	}
-	defer scoreSum.Free()
-	normalized, err := b.Divide(scores, scoreSum, s)
-	if err != nil {
-		return nil, fmt.Errorf("moe score norm: %w", err)
-	}
-	scores.Free()
-	scores = normalized
-
 	// --- Shared expert (always runs) ---
-	sharedGate, err := m.sharedGateProj.Forward(xFlat, b, s)
+	sharedOut, err := m.sharedExpertForward(xFlat, b, s)
 	if err != nil {
-		return nil, fmt.Errorf("moe shared gate: %w", err)
-	}
-	defer sharedGate.Free()
-	sharedUp, err := m.sharedUpProj.Forward(xFlat, b, s)
-	if err != nil {
-		return nil, fmt.Errorf("moe shared up: %w", err)
-	}
-	defer sharedUp.Free()
-	sharedAct, err := llm.SwiGLU(sharedUp, sharedGate, b, s)
-	if err != nil {
-		return nil, fmt.Errorf("moe shared swiglu: %w", err)
-	}
-	defer sharedAct.Free()
-	sharedOut, err := m.sharedDownProj.Forward(sharedAct, b, s)
-	if err != nil {
-		return nil, fmt.Errorf("moe shared down: %w", err)
+		return nil, err
 	}
 	defer sharedOut.Free()
-
-	// Shared expert gate
-	sharedGateLogit, err := m.sharedExpertGate.Forward(xFlat, b, s)
-	if err != nil {
-		return nil, fmt.Errorf("moe shared_expert_gate: %w", err)
-	}
-	defer sharedGateLogit.Free()
-	sharedGateSigmoid, err := b.Sigmoid(sharedGateLogit, s)
-	if err != nil {
-		return nil, fmt.Errorf("moe shared sigmoid: %w", err)
-	}
-	defer sharedGateSigmoid.Free()
-	sharedOut, err = b.Multiply(sharedGateSigmoid, sharedOut, s)
-	if err != nil {
-		return nil, fmt.Errorf("moe shared gate*out: %w", err)
-	}
 
 	// --- Routed experts via gather_qmm ---
 	// x must be [BS, 1, 1, H]: the lhs batch dims [BS, 1] broadcast against

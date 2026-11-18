@@ -166,7 +166,21 @@ func (q *Qwen35) PrepareCompiledDecode(promptLen, maxTokens int, cache *llm.KVCa
 	// kernel fusion (which keeps fp32 intermediates where eager rounds to
 	// bf16 between kernels). Either transform is enough to flip near-tie
 	// argmax tokens and break parity with the eager decode path.
-	if err := mlx.SetCompileMode(mlx.CompileModeNoSimplify); err != nil {
+	//
+	// SINTER_COMPILED_DECODE_MODE=fuse selects MLX's default simplify+fuse
+	// transform instead. That trades eager parity for fewer kernel launches,
+	// so it is a throughput experiment, not a production setting. Measured
+	// on qwen3.6-35b-a3b-4bit: 54.8/50.3 tok/s at short context and
+	// 45.2/45.6 at 2541 tokens, no better than plain eager decode — kernel
+	// count is not what bounds decode, so the default stays NO_SIMPLIFY.
+	mode := mlx.CompileModeNoSimplify
+	switch os.Getenv("SINTER_COMPILED_DECODE_MODE") {
+	case "fuse", "enabled":
+		mode = mlx.CompileModeEnabled
+	case "nofuse":
+		mode = mlx.CompileModeNoFuse
+	}
+	if err := mlx.SetCompileMode(mode); err != nil {
 		return fail(fmt.Errorf("qwen35: compiled decode: set compile mode: %w", err))
 	}
 	compiled, err := plain.Compile(false) // fixed shapes by design
@@ -363,23 +377,28 @@ func (q *Qwen35) ForwardDecodeCompiled(tokenArr tensor.Array, pos int) (tensor.A
 	if err != nil {
 		return nil, fmt.Errorf("qwen35: compiled decode argmax: %w", err)
 	}
+	tArgmax := time.Now()
 	idx64, err := mlx.AsType(idxArr, mlx.Int64, cd.streamM)
 	idxArr.Free()
 	if err != nil {
 		return nil, fmt.Errorf("qwen35: compiled decode argmax cast: %w", err)
 	}
+	tCast := time.Now()
 	next, err := mlx.Reshape(idx64, []int{1, 1}, cd.streamM)
 	idx64.Free()
 	if err != nil {
 		return nil, fmt.Errorf("qwen35: compiled decode argmax reshape: %w", err)
 	}
+	tReshape := time.Now()
 	if err := next.AsyncEval(); err != nil {
 		next.Free()
 		return nil, fmt.Errorf("qwen35: compiled decode async eval: %w", err)
 	}
 	if debugCompiledDecode() {
-		log.Printf("qwen35: compiled step pos=%d total=%.3fs (apply=%.3f tail=%.3f)",
-			pos, time.Since(t0).Seconds(), applyDone.Sub(t0).Seconds(), time.Since(applyDone).Seconds())
+		log.Printf("qwen35: compiled step pos=%d total=%.3fs (apply=%.3f argmax=%.3f cast=%.3f reshape=%.3f async=%.3f)",
+			pos, time.Since(t0).Seconds(), applyDone.Sub(t0).Seconds(),
+			tArgmax.Sub(applyDone).Seconds(), tCast.Sub(tArgmax).Seconds(),
+			tReshape.Sub(tCast).Seconds(), time.Since(tReshape).Seconds())
 	}
 	return next, nil
 }
