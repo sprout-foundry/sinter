@@ -205,6 +205,10 @@ whether the stall is occupancy, dependency serialization or a bad access
 pattern; the ablations available from Go are now exhausted, and each one
 tried has come back negative.
 
+The capture path is verified working — see the command in Verified
+commands. It needs `MTL_CAPTURE_ENABLED=1`, which the earlier attempt was
+missing.
+
 **Consumer follow-up.** sprout's `pkg/localmodel/local_provider_chat.go` sets
 `PromptLookupMaxDrafts = 6` in two places, so production still takes the
 prompt-lookup path even though it now measures slower than compiled decode.
@@ -425,6 +429,18 @@ SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \
 
 # Closure-boundary cost for 65 inputs (prints dispatch vs dispatch+eval)
 SINTER_BACKEND=metal go test -count=1 -run TestSpikeApply65Inputs -v ./mlx/
+
+# Metal capture of steady-state decode, for per-kernel GPU times in
+# Instruments. MTL_CAPTURE_ENABLED=1 is REQUIRED — without it the Metal debug
+# layer is absent and start_capture fails with "Capture layer is not
+# inserted". The bundle is large (21GB for the 35B, because it dumps every
+# buffer); capture with Instruments' reduced-data option if space matters.
+mkdir -p /tmp/sprout/capture
+MTL_CAPTURE_ENABLED=1 SINTER_BACKEND=metal \
+SINTER_MTP_PARITY_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \
+SINTER_CAPTURE_DIR=/tmp/sprout/capture \
+  go test -count=1 -run TestScratchMetalCapture -v ./llm/
+# then: open /tmp/sprout/capture/compiled.gputrace in Instruments
 
 # Image cap end to end over HTTP (scratch)
 SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/Qwen3.5-2B-4bit \
