@@ -64,17 +64,47 @@ real single-command-buffer graph the same change is worth 3%. Standalone
 per-call timings on this machine overstate by 3-4x because each AsyncEval
 commits its own command buffer — do not trust them for absolute cost.
 
-**Where the ~16ms/token actually goes** (35B, short context, compiled):
+**Where the ~15.4ms/token actually goes** (35B, short context, compiled).
+Measured by switching each block off in the traced graph and timing the
+decode loop (`SINTER_ABLATE=attn|moe|delta`, 3 rounds, best of each — the
+numbers reproduce to ±0.5%):
 
-- weight reads ~1590MB/token (505MB DeltaNet projections, 660MB MoE, 136MB
-  full attention, 286MB `lm_head`)
-- MoE (40 layers): 3.1ms for 660MB — 213 GB/s, already dense-equivalent, so
-  the expert dispatch is NOT the problem. The router chain is inside the noise
-- linear attention (30 layers): ~4.5ms, of which ~2.9ms is the projections
-  (now merged) and the rest is the recurrent kernel, conv and norms
-- vocabulary head: 2.0ms (286MB, 143 GB/s); argmax over 248k vocab: 0.5ms
-- full attention (10 layers): ~1ms
-- elementwise norms and residual adds: ~0.4ms under compile (2.2ms eager)
+| component | share | ms/token | tok/s with it removed |
+|---|---|---|---|
+| MoE (40 layers) | **50%** | 7.61 | 129.6 |
+| full attention (10 layers) | **35%** | 5.34 | 100.1 |
+| DeltaNet block (30 layers) | 7% | 1.06 | 70.1 |
+| vocabulary head | 6% | ~0.9 | — |
+| **total** | | **15.4** | 65.1 |
+
+The four add up to the whole step, which is the check that makes this
+trustworthy. Weight reads are ~1590MB/token (505MB DeltaNet projections,
+660MB MoE, 136MB full attention, 286MB `lm_head`) — a 4ms floor at 400 GB/s,
+so the model runs at roughly a quarter of peak bandwidth and **no single
+block is close to its own floor**: the MoE moves 660MB in 7.6ms (87 GB/s),
+full attention 136MB in 5.3ms (26 GB/s).
+
+**This replaces the earlier floor-table estimates, which were wrong by 2-5x**
+and pointed at the wrong blocks. Two in particular:
+
+- The **vocabulary head was never the problem.** An ablation that replaces
+  its output with zeros appeared to save 13.3ms (86% of the step) — but that
+  variant runs at 2.21ms/token, *below* the 3.65ms weight-read floor, which
+  is physically impossible. MLX skips the layer computation once the logits
+  stop depending on the hidden state, so the measurement was an artifact. The
+  head's real cost is ~0.9ms. **Any ablation that breaks the graph's
+  dependency chain is invalid; check the result against the bandwidth floor
+  before believing it.**
+- The **DeltaNet block is cheap** (1.1ms), not the 4.5ms previously
+  attributed to it. The projections were already merged and the recurrent
+  kernel is not the bottleneck it looked like.
+
+**Full attention is the anomaly worth chasing next**: 10 layers, 136MB of
+weights, 5.3ms — 26 GB/s, the worst effective bandwidth in the model, and
+534µs per layer at a context short enough that SDPA itself is trivial. The
+suspects are the fixed-capacity K/V `Where`-scatter (which materializes the
+whole buffer every step) and the per-layer mask construction. That is a
+concrete, testable target, unlike "per-layer overhead".
 
 **Closure staging is not a cost — that line was wrong.** The earlier estimate
 of ~1.5ms for staging 30 recurrent states in and out does not survive
@@ -82,24 +112,14 @@ measurement. `Closure.Apply` passes array handles, not data: a 65-input apply
 dispatches in **73µs** (`TestSpikeApply65Inputs`), and the whole per-token
 apply is 1ms of CPU against 12ms of GPU, so it is entirely hidden. The
 recurrent state's 120MB/token of read+write is real, but it is the kernel's
-own traffic, counted below, not a boundary copy.
+own traffic, not a boundary copy.
 
-**Nothing here is bandwidth-bound.** Against each block's own floor at
-400 GB/s, every one runs 2-5x slow:
-
-| block | bytes/token | floor | measured | effective |
-|---|---|---|---|---|
-| DeltaNet projections (30) | 505MB | 1.26ms | 2.9ms | 174 GB/s |
-| MoE (40) | 660MB | 1.65ms | 3.1ms | 213 GB/s |
-| full attention (10) | 136MB | 0.34ms | 1.0ms | 136 GB/s |
-| vocabulary head | 286MB | 0.72ms | 2.0ms | 143 GB/s |
-| DeltaNet recurrent state (30) | 120MB | 0.30ms | 1.6ms | **75 GB/s** |
-
-The recurrent kernel is the worst and the simplest: it loads a 2MB fp32
-state, does one step of ~8 flops per element, and stores it back — a
-memcpy-shaped kernel at 75 GB/s. It is fp32 because the checkpoint declares
-`mamba_ssm_dtype: float32`, so halving it to bf16 is a numerics change, not
-a free win.
+The recurrent kernel looked like the worst offender on paper — it loads a 2MB
+fp32 state, does one step of ~8 flops per element, and stores it back, a
+memcpy-shaped kernel — but the ablation shows the whole DeltaNet block is
+only 1.1ms of the step, so it is not where the time is. It is fp32 because
+the checkpoint declares `mamba_ssm_dtype: float32`, so halving it to bf16 is
+a numerics change, not a free win, and not worth spending on a 7% block.
 
 **Two knobs tested, both dead ends.** The recurrent kernel's threadgroup
 count is not the problem: `SetThreadGroup(32, 4/8/16, 1)` — 1024, 512 and
@@ -173,10 +193,9 @@ The 35B reads *half* the bytes per layer of the 4B in the *same* time. Its
 decode is set by a ~400µs per-layer cost that barely moves with bytes, times
 40 layers. That is why merging kernels gave 3% rather than the 5x a
 micro-benchmark suggested, and why chasing bandwidth is the wrong frame:
-something per-layer is paying a fixed cost. Two candidates worth a real GPU
-profile (Metal capture, read in Instruments): kernel-to-kernel serialization
-inside each layer, and the MoE's 8-expert `gather_qmm` being internally
-serialized even though its aggregate bandwidth looks fine.
+something per-layer is paying a fixed cost. The component ablation above
+narrows it to two blocks — MoE (7.6ms) and full attention (5.3ms) — and
+rules out the DeltaNet block (1.1ms) that this table's averaging hid.
 
 A slot-count sweep of `gather_qmm` supports the second: k=1, 2, 4, 8, 16 cost
 0.152, 0.154, 0.155, 0.173, 0.191ms, and k=8 pointing at the *same* expert
@@ -201,7 +220,7 @@ serialized. A Metal System Trace of a marked decode window (64 tokens,
 95.1% coverage**, 23 gaps totalling 47ms, mean 2.0ms, max 20.3ms. There is
 no idle time to reclaim — even eliminating every gap would buy 5%.
 
-So the time is inside the kernels, which is what the floor table above
+So the time is inside the kernels, which is what the component ablation
 already said. Candidate #1 is dead; only kernel speed is left.
 
 Method, since the trace tooling was not obvious: `.gputrace` bundles are
@@ -213,18 +232,27 @@ model size. `xctrace record --template 'Metal System Trace'` produces a
 that writes wall-clock markers around the decode lets the window be cut
 exactly. See Verified commands.
 
-**Target.** >100 tok/s on the 35B. Summing the measured parts gives ~11.5ms
-of real work, i.e. a ~87 tok/s ceiling with the current kernels. The floor
-table above says where that ceiling comes from: the large-tensor blocks all
-run 2-5x off their own bandwidth floor. Small-op count is not a factor
-(measured above) and neither is dependency serialization (profiled above),
-so the remaining work is making those kernels saturate memory. The two
-furthest from their floor are the DeltaNet recurrent kernel (75 GB/s — a
-memcpy-shaped kernel over a 2MB fp32 state) and the vocabulary head
-(143 GB/s). What is left to determine is occupancy versus access pattern,
-which needs per-kernel GPU counters rather than the timeline: the Metal
-System Trace used above has the Shader Timeline disabled, so it gives
-coverage but not per-kernel attribution.
+**Target.** >100 tok/s on the 35B. The ablation puts the whole step at
+15.4ms, so the ceiling with today's kernels is ~65 tok/s — the components
+already sum to the total, and there is no unaccounted slack to reclaim.
+Getting to 100 means making two blocks faster, in this order:
+
+1. **Full attention — 5.3ms for 136MB (26 GB/s), the worst effective
+   bandwidth in the model.** 534µs per layer at a context short enough that
+   SDPA itself is trivial, so the cost is in the surrounding ops: the
+   fixed-capacity K/V `Where`-scatter materializes the whole buffer every
+   step (O(capacity), and it grows with the conversation), plus the per-layer
+   mask construction. This is the most promising target because the suspects
+   are structural, not micro-architectural.
+2. **MoE — 7.6ms for 660MB (87 GB/s).** The largest single block. The
+   `gather_qmm` slot sweep above says the call is fixed-cost dominated (k=1
+   and k=8 cost the same), so the lever is per-call overhead, not bytes.
+
+Both need per-kernel GPU counters to separate occupancy from access pattern.
+The Metal System Trace used above has the Shader Timeline disabled, so it
+gives coverage but not per-kernel attribution — re-record with that enabled,
+or use Xcode's Metal debugger on a smaller model, because the 35B's
+`.gputrace` is not openable on a 64GB machine.
 
 The capture path is verified working — see the command in Verified
 commands. It needs `MTL_CAPTURE_ENABLED=1`, which the earlier attempt was
@@ -334,8 +362,10 @@ Qwen3.5-2B-4bit, same machine: prefill ~1736 tok/s, decode ~141 tok/s
   (35B 51.6-53.8 at k=4 and k=6, 2B 106-114). Instrumented: 362 of 414 decode
   steps found no n-gram candidate, so the search and verify batches cost more
   than the accepted drafts save. `openaisserver` no longer enables it.
-- **MoE expert dispatch** — 213 GB/s, dense-equivalent. The router chain is
-  inside the noise.
+- **MoE expert dispatch being the *dispatch*'s fault** — the block is 50% of
+  the step (7.6ms for 660MB, 87 GB/s), but the `gather_qmm` slot sweep shows
+  k=1 and k=8 cost the same, so the cost is per-call fixed overhead, not the
+  expert selection or the bytes gathered.
 - **Kernel count** — merging the four DeltaNet input projections into one
   matmul (bit-identical) is worth 3%, not the 5x a standalone benchmark
   suggests. But do not conclude that kernels never matter: the fused
@@ -416,6 +446,13 @@ Qwen3.5-2B-4bit, same machine: prefill ~1736 tok/s, decode ~141 tok/s
   `TestPrefixCacheParity`, `TestPrefixCacheSpeedsUp`). Test the `llm`
   package on MLX; use the ggml tags for `llm/vision`, `llm/mropeparity` and
   `llm/openaisserver`.
+- **An ablation that breaks the graph's dependency chain is invalid.** Replacing
+  the vocabulary head's output with a constant made decode appear to run at
+  2.21ms/token — below the 3.65ms floor implied by the model's own weight
+  bytes, which is impossible. MLX stopped computing the layers once nothing
+  downstream depended on them. Always check an ablation against the
+  bandwidth floor before believing it; ablations that keep the head depending
+  on the real hidden state (`attn`, `moe`, `delta`) are the ones that hold up.
 - **Benchmark on a quiet machine.** Every decode number in this document is
   decode-only tok/s from a greedy run. A concurrent `tsc --noEmit` or a
   transcription job moved the same measurement by 2x, and load average above
@@ -436,6 +473,10 @@ SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/Qwen3.5-2B-
 # Decode-path A/B (scratch, decode-only tok/s, short and long prompt)
 SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \
   go test -count=1 -run TestScratchDecodePaths -v ./llm/qwen35/
+
+# Component cost attribution (scratch, SINTER_ABLATE=attn|moe|delta)
+SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \
+  go test -count=1 -run TestScratchAblate -v ./llm/qwen35/
 
 # Performance harness (scratch, prints prefill/decode splits)
 SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \

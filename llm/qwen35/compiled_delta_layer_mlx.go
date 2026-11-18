@@ -110,9 +110,17 @@ func (q *Qwen35) compiledDeltaLayer(x tensor.Array, g *gatedDeltaNet, stateIn []
 	}
 	defer decay.Free()
 
-	y, newState, err := gatedDeltaUpdate(q2d, k2d, v2d, decay, beta, state, b, s)
-	if err != nil {
-		return nil, nil, fmt.Errorf("gated delta update: %w", err)
+	var y, newState tensor.Array
+	if ablate("delta") {
+		// Scratch ablation: skip the recurrence itself, keeping y's and the
+		// state's shapes so the rest of the layer traces unchanged.
+		y = b.RetainArray(v2d)
+		newState = b.RetainArray(state)
+	} else {
+		y, newState, err = gatedDeltaUpdate(q2d, k2d, v2d, decay, beta, state, b, s)
+		if err != nil {
+			return nil, nil, fmt.Errorf("gated delta update: %w", err)
+		}
 	}
 	defer y.Free()
 

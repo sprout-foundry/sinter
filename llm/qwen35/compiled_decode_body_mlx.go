@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"os"
 
 	"github.com/sprout-foundry/sinter/mlx"
 	"github.com/sprout-foundry/sinter/tensor"
@@ -56,6 +57,12 @@ func (q *Qwen35) compiledDecodeBody(cd *compiledDecode, in []*mlx.Array) ([]*mlx
 	return append(outputs, logits.(*mlx.Array)), nil
 }
 
+// ablate reports whether the given component is switched off by the scratch
+// SINTER_ABLATE diagnostic. Each ablation keeps the component's output shape
+// so the rest of the graph traces unchanged; numerics change, so these are
+// timing-only experiments, never parity checks.
+func ablate(what string) bool { return os.Getenv("SINTER_ABLATE") == what }
+
 // compiledLayer runs one decoder layer with explicit state I/O. stateIn is
 // this layer's (K,V) or (State,ConvState) input pair; the returned slices
 // are the updated pair in the same order. h is consumed: the caller frees
@@ -73,7 +80,16 @@ func (q *Qwen35) compiledLayer(h tensor.Array, layerIdx int, pos tensor.Array, s
 
 	var attnOut tensor.Array
 	var updates []*mlx.Array
-	if lw.linearAttn != nil {
+	if ablate("attn") {
+		// Scratch ablation: skip the whole attention block, keeping the
+		// residual shape and passing the layer state through unchanged so
+		// the closure's output count still matches.
+		attnOut = b.RetainArray(normed)
+		updates = []*mlx.Array{
+			b.RetainArray(stateIn[0]).(*mlx.Array),
+			b.RetainArray(stateIn[1]).(*mlx.Array),
+		}
+	} else if lw.linearAttn != nil {
 		attnOut, updates, err = q.compiledDeltaLayer(normed, lw.linearAttn, stateIn)
 		if err != nil {
 			return nil, nil, fmt.Errorf("linear attention: %w", err)
@@ -99,7 +115,10 @@ func (q *Qwen35) compiledLayer(h tensor.Array, layerIdx int, pos tensor.Array, s
 	defer normed2.Free()
 
 	var ffnOut tensor.Array
-	if lw.moe != nil {
+	if ablate("moe") {
+		// Scratch ablation: skip the MoE (and the dense FFN) entirely.
+		ffnOut = b.RetainArray(normed2)
+	} else if lw.moe != nil {
 		ffnOut, err = lw.moe.forward(normed2, q)
 	} else {
 		ffnOut, err = q.swiglu(normed2, lw)
