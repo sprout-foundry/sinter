@@ -1,6 +1,6 @@
 # sinter — handoff
 
-Last updated: 2026-11-18 05:40
+Last updated: 2026-11-18 06:05
 
 Vision input works end to end on MLX and GGML, and the bugs that were
 blocking it are fixed and released. This document is the forward plan:
@@ -101,27 +101,51 @@ memcpy-shaped kernel at 75 GB/s. It is fp32 because the checkpoint declares
 `mamba_ssm_dtype: float32`, so halving it to bf16 is a numerics change, not
 a free win.
 
-**First thing to try on the recurrent kernel, before reaching for
-Instruments.** For decode T=1, so the kernel is launch-latency-bound, not
-bandwidth-bound: it launches 1024 threadgroups of 128 threads
-(`SetGrid(32, Dv, B*Hv)`, `SetThreadGroup(32, 4, 1)`) to do ~8 flops each.
-The threadgroup count is the knob — `(32, 8, 1)` or `(32, 16, 1)` cuts it
-4-8x while each thread still owns its own `dv_idx`, so numerics cannot
-change. Verify with token-id equality plus an interleaved A/B on a quiet
-machine (load < 3); this pass could not measure it.
+**Two knobs tested, both dead ends.** The recurrent kernel's threadgroup
+count is not the problem: `SetThreadGroup(32, 4/8/16, 1)` — 1024, 512 and
+256 threadgroups — measured 54.7 / 54.6 / 53.8 tok/s interleaved at 2541
+tokens. No effect. And the compile transform is not a lever either:
+`SINTER_COMPILED_DECODE_MODE=fuse` measured 64.5/63.7 against 62.6/62.2
+default at short context, and 59.8/60.3 against 60.0/60.2 at 2541 tokens —
+within noise at long context, +2-3% at short, not worth trading the
+bit-exact parity guarantee for.
+
+**The fused gated-delta kernel is worth +14%, and it is already the
+default.** Interleaved and bit-identical: 63.6/63.6 vs 55.7/55.3 tok/s at
+short context, 58.6/57.2 vs 50.9/50.2 at 2541 tokens (`SINTER_DELTA_OPS=1`
+forces the ops loop). That is the single largest measured win in the decode
+path, and it points the way: the ops loop materializes ~20 intermediates per
+layer over a 2MB state array, so what costs is bytes written to intermediate
+buffers, not launches. Same lesson as the merge experiments. The remaining
+lever is therefore fusing the per-layer norm and elementwise chains (two
+`scaleRMSNorm` plus `rmsNormGated` per DeltaNet layer, 30 layers), not
+removing kernels.
+
+**Steady-state decode, interleaved on a quiet machine** (the earlier
+single-shot numbers were contaminated by the first generation after load,
+which pays Metal kernel compilation):
+
+| model | short | 2541-token prompt |
+|---|---|---|
+| Qwen3.5-2B-4bit | 145 | 126 |
+| qwen3.5-4b-4bit | 82 | 70 |
+| qwen3.6-35b-a3b-4bit | 63 | 60 |
+
+The 35B's long-context figure is much better than the 48.5 a single cold run
+reports: once the first generation is excluded it is ~60, not ~49.
 
 Every block being uniformly 2-5x off its floor is the signature of a
 latency/occupancy problem, not a bytes problem — which is exactly what a
 Metal capture would resolve, and why no host-side restructuring has moved
 the number.
 
-**Per-turn setup is ~40ms, and it is not worth caching.** The compiled
+**Per-turn setup is ~8-10ms, and it is not worth caching.** The compiled
 closure is traced and compiled on every `Generate` and released on return,
-which looked like an easy win. Measured: the Go-side trace and `Compile`
-are both under a millisecond, and the first apply is ~40ms. Caching the
-closure across turns would save that 40ms and nothing more, so it is not
-worth the shape-keying it would need. `SINTER_LOCAL_DEBUG=1` now prints
-the breakdown.
+which looked like an easy win. Measured: the Go-side trace is 3-6µs,
+`Compile` is 2-4µs, and the first apply is 8-10ms. Caching the closure
+across turns would save that 8-10ms and nothing more, so it is not worth the
+shape-keying it would need. `SINTER_LOCAL_DEBUG=1` now prints the
+breakdown.
 
 **The 35B is not bandwidth-starved — it is per-layer-overhead-bound.** Per
 layer, on the same machine, compiled decode costs:
@@ -158,12 +182,18 @@ count, and prefer full-model A/B ablations over isolated timings.
 
 **Target.** >100 tok/s on the 35B. Summing the measured parts gives ~11.5ms
 of real work, i.e. a ~87 tok/s ceiling with the current kernels. The floor
-table above says where that ceiling comes from: not bytes, since every block
-already runs 2-5x off its own bandwidth floor, but latency. Reaching 100
-means making the GPU saturate memory — a profile (Metal capture, read in
-Instruments) to find what stalls each block, not another scheduling change.
-The recurrent kernel is the cheapest place to start: it is the furthest from
-its floor (75 GB/s) and the simplest kernel in the graph.
+table above says where that ceiling comes from: not weight bytes, since
+every block already runs 2-5x off its own bandwidth floor, but the traffic
+each block adds on top — intermediates written and re-read. The fused
+gated-delta kernel's +14% is the proof: it wins by not materializing the
+ops loop's ~20 intermediates, not by launching less.
+
+So the next lever is fusing the per-layer norm and elementwise chains into
+Metal kernels, the way the delta recurrence already is. Per DeltaNet layer
+that is two `scaleRMSNorm` calls plus `rmsNormGated`, across 30 layers, each
+currently a handful of ops over a 2MB activation. That is real kernel work,
+not a scheduling change, and it is the only path left that the measurements
+point at.
 
 **Consumer follow-up.** sprout's `pkg/localmodel/local_provider_chat.go` sets
 `PromptLookupMaxDrafts = 6` in two places, so production still takes the
@@ -255,8 +285,13 @@ Qwen3.5-2B-4bit, same machine: prefill ~1736 tok/s, decode ~141 tok/s
   flat. It is a memory knob, not a speed knob.
 - **Compiled decode** — it was never running (see step 1). Now default-ON and
   worth 5-10%.
-- **Kernel fusion** — `SINTER_COMPILED_DECODE_MODE=fuse` is no better than
-  eager at either context length. Launch count is not the bottleneck.
+- **Kernel fusion** — `SINTER_COMPILED_DECODE_MODE=fuse` is +2-3% at short
+  context (64.5/63.7 vs 62.6/62.2) and within noise at 2541 tokens
+  (59.8/60.3 vs 60.0/60.2). Not worth trading the bit-exact parity
+  guarantee for. Launch count is not the bottleneck.
+- **Delta kernel threadgroup count** — `SetThreadGroup(32, 4/8/16, 1)`, i.e.
+  1024/512/256 threadgroups, measured 54.7/54.6/53.8 tok/s interleaved at
+  2541 tokens. The kernel is not threadgroup-scheduling-bound.
 - **Pipelined decode** — slower than compiled on all three models
   (35B 52.6/53.0, 2B 112.3/116.3, 4B 75.3/75.3). Now opt-in via
   `SINTER_PIPELINE_DECODE=1`.
@@ -268,7 +303,11 @@ Qwen3.5-2B-4bit, same machine: prefill ~1736 tok/s, decode ~141 tok/s
   inside the noise.
 - **Kernel count** — merging the four DeltaNet input projections into one
   matmul (bit-identical) is worth 3%, not the 5x a standalone benchmark
-  suggests. Fewer kernels is not the lever.
+  suggests. But do not conclude that kernels never matter: the fused
+  gated-delta kernel is worth **+14%** over the ops loop (63.6/63.6 vs
+  55.7/55.3 short, 58.6/57.2 vs 50.9/50.2 at 2541 tokens). The difference is
+  what the ops loop writes: ~20 intermediates per layer over a 2MB state
+  array. Bytes to intermediate buffers is the lever, launch count is not.
 - **Sampling path** — greedy/no-penalty vs the defaults is identical, so CPU
   argmax over the 248k vocab is not the cost (argmax itself is 0.5ms).
 - **Closure staging** — a 65-input `Closure.Apply` dispatches in 73µs
