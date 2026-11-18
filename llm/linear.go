@@ -121,6 +121,15 @@ func (l *Linear) Free() {
 // kernel: mixed quantization, differing quant parameters, or a bias on only
 // some of them.
 func MergeLinears(b tensor.Backend, s tensor.Stream, parts ...*Linear) (*Linear, error) {
+	return MergeLinearsAxis(b, s, 0, parts...)
+}
+
+// MergeLinearsAxis is MergeLinears with an explicit concatenation axis for
+// the packed quantized weights. MoE expert tensors are [experts, inter,
+// packed_hidden], so gate and up — which read the same input and differ only
+// along the intermediate axis — merge along axis 1. Full-precision weights
+// are stored pre-transposed, so their axis is shifted by one.
+func MergeLinearsAxis(b tensor.Backend, s tensor.Stream, axis int, parts ...*Linear) (*Linear, error) {
 	if len(parts) < 2 {
 		return nil, fmt.Errorf("merge linears: need at least two projections")
 	}
@@ -156,27 +165,27 @@ func MergeLinears(b tensor.Backend, s tensor.Stream, parts ...*Linear) (*Linear,
 			ws[i], scales[i], biases[i] = p.qW, p.qScales, p.qBiases
 		}
 		var err error
-		if out.qW, err = b.ConcatenateAxis(ws, 0, s); err != nil {
+		if out.qW, err = b.ConcatenateAxis(ws, axis, s); err != nil {
 			return nil, fmt.Errorf("merge linears: concat weights: %w", err)
 		}
-		if out.qScales, err = b.ConcatenateAxis(scales, 0, s); err != nil {
+		if out.qScales, err = b.ConcatenateAxis(scales, axis, s); err != nil {
 			out.Free()
 			return nil, fmt.Errorf("merge linears: concat scales: %w", err)
 		}
-		if out.qBiases, err = b.ConcatenateAxis(biases, 0, s); err != nil {
+		if out.qBiases, err = b.ConcatenateAxis(biases, axis, s); err != nil {
 			out.Free()
 			return nil, fmt.Errorf("merge linears: concat biases: %w", err)
 		}
 		out.qGroupSize, out.qBits, out.qMode = first.qGroupSize, first.qBits, first.qMode
 	case full == len(parts):
-		// Full-precision weights are stored pre-transposed [in, out], so the
-		// parts concatenate along the output axis 1.
+		// Full-precision weights are stored pre-transposed [..., in, out], so
+		// the parts concatenate one axis further along than the packed form.
 		ws := make([]tensor.Array, len(parts))
 		for i, p := range parts {
 			ws[i] = p.wT
 		}
 		var err error
-		if out.wT, err = b.ConcatenateAxis(ws, 1, s); err != nil {
+		if out.wT, err = b.ConcatenateAxis(ws, axis+1, s); err != nil {
 			return nil, fmt.Errorf("merge linears: concat weights: %w", err)
 		}
 	default:

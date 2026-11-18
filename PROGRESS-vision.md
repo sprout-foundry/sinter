@@ -46,6 +46,13 @@ constant-bounded slices). Output is bit-identical, and it is worth another
 +3%: 35B 58.8/59.1 → 60.1/61.0/61.2 tok/s, 4B 77.8/79.2 → 80.5/81.4, 2B a
 wash. Prefill is unchanged (8261ms for the 2541-token prompt).
 
+The routed MoE `gate_proj` and `up_proj` merged the same way, along the
+intermediate axis (`llm.MergeLinearsAxis`, one `gather_qmm` instead of two).
+Also bit-identical (same token ids), worth +2.2% on an interleaved A/B:
+baseline 58.9/59.1/59.6 vs merged 60.3/60.4/60.8, merged winning all three
+pairs. Two merges of the same class, each ~2-3% — consistent with the
+per-layer-overhead picture below, not with launch count being the lever.
+
 **Launch overhead is ruled out as the dominant cost.** MLX's kernel fusion on
 top of compile (`SINTER_COMPILED_DECODE_MODE=fuse`) measured 54.8/50.3 at short
 context and 45.2/45.6 at 2541 tokens — no better than eager. Replay alone is
@@ -86,6 +93,14 @@ something per-layer is paying a fixed cost. Two candidates worth a real GPU
 profile (Metal capture, read in Instruments): kernel-to-kernel serialization
 inside each layer, and the MoE's 8-expert `gather_qmm` being internally
 serialized even though its aggregate bandwidth looks fine.
+
+A slot-count sweep of `gather_qmm` supports the second: k=1, 2, 4, 8, 16 cost
+0.152, 0.154, 0.155, 0.173, 0.191ms, and k=8 pointing at the *same* expert
+costs the same as k=8 distinct (0.161 vs 0.170). Reading 8x the weight bytes
+is nearly free, so the call is fixed-cost dominated, not bandwidth bound. The
+absolute numbers are unusable (the identical full-MoE measurement swung 1.02ms
+→ 14.77ms between runs on a contended machine) — only the within-run shape is
+informative.
 
 **Micro-benchmark caveat, learned the hard way.** Standalone per-call timings
 on this machine overstate by 3-4x because each `AsyncEval` commits its own

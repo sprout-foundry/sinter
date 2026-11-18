@@ -34,6 +34,14 @@ type sparseMoeBlock struct {
 	numExperts       int
 	numExpertsPerTok int
 	normTopkProb     bool
+
+	// switchInProj is the routed gate_proj and up_proj merged along the
+	// intermediate axis: one gather_qmm instead of two. Both read the same
+	// x and differ only in which half of the intermediate axis they produce.
+	// nil when the merge was declined (mixed quantization); the separate
+	// switchGateProj/switchUpProj then stay in place.
+	switchInProj *llm.Linear
+	interSize    int
 }
 
 func (m *sparseMoeBlock) loadWeights(sf *llm.SafetensorsFile, prefix string, b tensor.Backend, s tensor.Stream, quant *llm.QuantConfig, lora *llm.LoraAdapter, mergedClasses map[string]bool) error {
@@ -80,6 +88,22 @@ func (m *sparseMoeBlock) loadWeights(sf *llm.SafetensorsFile, prefix string, b t
 	}
 
 	m.numExperts = m.switchGateProj.NumExperts()
+	if m.switchGateProj.IsQuantized() {
+		m.interSize = m.switchGateProj.QW().Shape()[1]
+	} else {
+		m.interSize = m.switchGateProj.WT().Shape()[2]
+	}
+
+	// Merge the routed gate and up experts along the intermediate axis, so
+	// the two gather_qmm calls become one. Both read the same x and produce
+	// disjoint halves of the intermediate axis. MergeLinearsAxis declines
+	// when the two are quantized differently, leaving them separate.
+	if merged, mErr := llm.MergeLinearsAxis(b, s, 1, m.switchGateProj, m.switchUpProj); mErr == nil {
+		m.switchInProj = merged
+		m.switchGateProj.Free()
+		m.switchUpProj.Free()
+		m.switchGateProj, m.switchUpProj = nil, nil
+	}
 	return nil
 }
 
@@ -95,6 +119,9 @@ func (m *sparseMoeBlock) free() {
 	}
 	if m.switchUpProj != nil {
 		m.switchUpProj.Free()
+	}
+	if m.switchInProj != nil {
+		m.switchInProj.Free()
 	}
 	if m.switchDownProj != nil {
 		m.switchDownProj.Free()
@@ -269,16 +296,42 @@ func (m *sparseMoeBlock) forward(x tensor.Array, q *Qwen35) (tensor.Array, error
 	defer x4d.Free()
 
 	// inds is [BS, k] — these are the expert indices per token
-	gateOut, err := b.GatherQuantizedMatMul(x4d, m.switchGateProj.QW(), m.switchGateProj.QScales(), m.switchGateProj.QBiases(), nil, inds, true, m.switchGateProj.QGroupSize(), m.switchGateProj.QBits(), m.switchGateProj.QMode(), false, s)
-	if err != nil {
-		return nil, fmt.Errorf("moe gather gate_proj: %w", err)
+	var gateOut, upOut tensor.Array
+	if m.switchInProj != nil {
+		// Merged gate+up: one gather produces both halves of the
+		// intermediate axis, split back out here.
+		both, err := b.GatherQuantizedMatMul(x4d, m.switchInProj.QW(), m.switchInProj.QScales(), m.switchInProj.QBiases(), nil, inds, true, m.switchInProj.QGroupSize(), m.switchInProj.QBits(), m.switchInProj.QMode(), false, s)
+		if err != nil {
+			return nil, fmt.Errorf("moe gather gate_up: %w", err)
+		}
+		defer both.Free()
+		shape := both.Shape()
+		strides := make([]int, len(shape))
+		for i := range strides {
+			strides[i] = 1
+		}
+		startGate := make([]int, len(shape))
+		stopGate := append([]int{}, shape...)
+		stopGate[len(shape)-1] = m.interSize
+		startUp := append([]int{}, startGate...)
+		startUp[len(shape)-1] = m.interSize
+		if gateOut, err = b.Slice(both, startGate, stopGate, strides, s); err != nil {
+			return nil, fmt.Errorf("moe split gate: %w", err)
+		}
+		if upOut, err = b.Slice(both, startUp, shape, strides, s); err != nil {
+			gateOut.Free()
+			return nil, fmt.Errorf("moe split up: %w", err)
+		}
+	} else {
+		if gateOut, err = b.GatherQuantizedMatMul(x4d, m.switchGateProj.QW(), m.switchGateProj.QScales(), m.switchGateProj.QBiases(), nil, inds, true, m.switchGateProj.QGroupSize(), m.switchGateProj.QBits(), m.switchGateProj.QMode(), false, s); err != nil {
+			return nil, fmt.Errorf("moe gather gate_proj: %w", err)
+		}
+		if upOut, err = b.GatherQuantizedMatMul(x4d, m.switchUpProj.QW(), m.switchUpProj.QScales(), m.switchUpProj.QBiases(), nil, inds, true, m.switchUpProj.QGroupSize(), m.switchUpProj.QBits(), m.switchUpProj.QMode(), false, s); err != nil {
+			gateOut.Free()
+			return nil, fmt.Errorf("moe gather up_proj: %w", err)
+		}
 	}
 	defer gateOut.Free()
-
-	upOut, err := b.GatherQuantizedMatMul(x4d, m.switchUpProj.QW(), m.switchUpProj.QScales(), m.switchUpProj.QBiases(), nil, inds, true, m.switchUpProj.QGroupSize(), m.switchUpProj.QBits(), m.switchUpProj.QMode(), false, s)
-	if err != nil {
-		return nil, fmt.Errorf("moe gather up_proj: %w", err)
-	}
 	defer upOut.Free()
 
 	// SwiGLU: silu(gate) * up
