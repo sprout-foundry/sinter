@@ -9,10 +9,11 @@ established so they are not repeated.
 
 ## Where things stand
 
-- **sinter v0.8.2** is tagged and pushed. `main` carries the decode-path
-  default change below (unreleased).
-- **sprout** is on `sinter v0.8.2`, committed and pushed to `main`; publishing
-  the sprout release is the owner's step.
+- **sinter v0.8.3** is tagged and pushed. It carries everything below:
+  compiled decode as the default, the three projection merges, and the
+  cross-restart prefix store.
+- **sprout** is on `sinter v0.8.3` (`c8c6cea954`), committed and pushed to
+  `main`; publishing the sprout release is the owner's step.
 - MLX is the product path (M1 Max, 64GB, 400 GB/s). GGML is secondary and has
   a known large-image instability (see Gotchas).
 
@@ -21,8 +22,10 @@ vision merger's missing biases, sharded-checkpoint `TensorShape`, the
 per-image feature cache, and the image token cap (1024). Then the decode-path
 defaults: pipelined decode is now opt-in and prompt-lookup is off, which
 unlocks compiled decode as the default and is worth 5-10% on every model
-measured. Then the cross-restart prefix store (see "Just shipped" below),
-which takes a cold first turn on the 35B from 8.7s to 0.4s.
+measured. Then three bit-identical projection merges (DeltaNet inputs, routed
+MoE gate/up, shared-expert inputs), and the cross-restart prefix store (see
+"Just shipped" below), which takes a cold first turn on the 35B from 8.7s to
+0.4s.
 
 ## Engine comparison — mlx-lm is 18-22% faster on identical weights
 
@@ -374,11 +377,37 @@ Two blocks dominate the step, in this order:
    (`TestScratchAttnChain`); per-op timing and in-model sub-ablations both
    fail here, for the reasons above.
 
-The gap that is not yet attributed — roughly 12 of the 18 points — is most
-likely the pipelining difference: mlx-lm overlaps the next token's compute
-with CPU sampling via `mx.async_eval`, and sinter's `SINTER_PIPELINE_DECODE`
-measures exactly the eager number, so it is not overlapping at all. That is
-the next thing to chase, and it is contained: the scaffolding exists.
+**Pipelining is ruled out as the explanation.** mlx-lm's `generate_step` and
+sinter's `usePipelined` loop are the *same algorithm*: build the next step
+chained onto the current token array, `async_eval` it, then read back the
+current one — so the read-back of step i overlaps the dispatch of step i+1.
+Read both side by side (`mlx_lm/generate.py` lines 454-467 vs the
+`usePipelined` branch in `llm/model.go`). sinter's pipelined path measuring
+the eager number is therefore not a bug to fix: with a 95%-busy GPU and a
+hard data dependency between consecutive tokens, there is almost nothing to
+overlap. Do not spend more time here.
+
+**The 2.7ms gap is accounted for by the compiled path's own design costs.**
+63 tok/s is 15.9ms/token; mlx-lm's 76 is 13.2ms. The difference:
+
+| cost | per token | why sinter pays it |
+|---|---|---|
+| closure staging | ~1.5ms | 30 DeltaNet recurrent states cross the closure boundary in and out every step |
+| additive SDPA mask | 0.64ms | the K/V buffer is capacity-sized, so attention needs a mask |
+| in-graph `Where` scatter | 0.29ms | the new K/V row is written by a full-capacity select |
+
+All three are consequences of one decision: compiled decode needs static
+shapes, so the cache cannot be exactly `pos+1` long and cannot be mutated in
+place. mlx-lm avoids all three by never compiling — it slices its cache to
+`offset` and writes the new row host-side. That is the whole 18%: not a
+missing kernel, a different tradeoff.
+
+So closing the gap is not an optimization, it is a choice between two
+designs. The experiment worth running is the one that tests mlx-lm's design
+in sinter: the eager path with an exact-length cache (no mask, no scatter)
+plus async pipelining. If eager-with-exact-cache reaches ~76, the compiled
+path is a net loss on this model and should stop being the default. That is a
+structural change, so measure it before committing to it.
 
 Per-kernel GPU counters would settle the rest. The Metal System Trace has the
 Shader Timeline disabled and xctrace exposes no option to enable it, so it
@@ -390,12 +419,13 @@ The capture path is verified working — see the command in Verified
 commands. It needs `MTL_CAPTURE_ENABLED=1`, which the earlier attempt was
 missing.
 
-**Consumer follow-up.** sprout's `pkg/localmodel/local_provider_chat.go` sets
-`PromptLookupMaxDrafts = 6` in two places, so production still takes the
-prompt-lookup path even though it now measures slower than compiled decode.
-Removing those two assignments (and bumping sprout onto the sinter release
-that carries the new defaults) is what actually delivers the 5-10% in the
-product.
+**Consumer follow-up — done.** sinter v0.8.3 is tagged and pushed, and sprout
+is on it (`c8c6cea954`): both `PromptLookupMaxDrafts = 6` assignments are
+gone from `pkg/localmodel/local_provider_chat.go`, so the compiled path is
+what production now runs. Verified by the gate chain rather than by
+inspection alone: `DefaultGenerateConfig` leaves `PromptLookupMaxDrafts` at
+0, sprout sets `Temperature=0`/`RepetitionPenalty=0`, so `useGPUArgmax` is
+true, `usePromptLookup` is false, and `useCompiled` engages.
 
 **Measure with** `llm/qwen35/zz_perf_test.go` (gitignored scratch):
 `TestScratchPerfProfile` prints prefill/decode splits for a short turn, a
@@ -487,13 +517,18 @@ Qwen3.5-2B-4bit, same machine: prefill ~1736 tok/s, decode ~141 tok/s
 - **Delta kernel threadgroup count** — `SetThreadGroup(32, 4/8/16, 1)`, i.e.
   1024/512/256 threadgroups, measured 54.7/54.6/53.8 tok/s interleaved at
   2541 tokens. The kernel is not threadgroup-scheduling-bound.
-- **Pipelined decode** — slower than compiled on all three models
-  (35B 52.6/53.0, 2B 112.3/116.3, 4B 75.3/75.3). Now opt-in via
-  `SINTER_PIPELINE_DECODE=1`.
+- **Pipelined decode as the explanation for the mlx-lm gap** — sinter's loop
+  is the same algorithm as mlx-lm's `generate_step` (build next chained on the
+  current token, `async_eval`, then read back the current). It measures the
+  eager number because with a 95%-busy GPU and a hard token-to-token data
+  dependency there is nothing to overlap. Also slower than compiled on all
+  three models (35B 52.6/53.0, 2B 112.3/116.3, 4B 75.3/75.3). Opt-in via
+  `SINTER_PIPELINE_DECODE=1`; do not re-chase it as a gap.
 - **Prompt-lookup** — slower than compiled even on verbatim-echo prompts
   (35B 51.6-53.8 at k=4 and k=6, 2B 106-114). Instrumented: 362 of 414 decode
   steps found no n-gram candidate, so the search and verify batches cost more
-  than the accepted drafts save. `openaisserver` no longer enables it.
+  than the accepted drafts save. `openaisserver` no longer enables it, and
+  sprout no longer sets it.
 - **MoE expert dispatch being the *dispatch*'s fault** — the block is 50% of
   the step (7.6ms for 660MB, 87 GB/s), but the `gather_qmm` slot sweep shows
   k=1 and k=8 cost the same, so the cost is per-call fixed overhead, not the
