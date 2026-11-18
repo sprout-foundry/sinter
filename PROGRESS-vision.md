@@ -101,10 +101,24 @@ and pointed at the wrong blocks. Two in particular:
 
 **Full attention is the anomaly worth chasing next**: 10 layers, 136MB of
 weights, 5.3ms — 26 GB/s, the worst effective bandwidth in the model, and
-534µs per layer at a context short enough that SDPA itself is trivial. The
-suspects are the fixed-capacity K/V `Where`-scatter (which materializes the
-whole buffer every step) and the per-layer mask construction. That is a
-concrete, testable target, unlike "per-layer overhead".
+534µs per layer at a context short enough that SDPA itself is trivial. Two
+candidate explanations have been measured and eliminated:
+
+- **Not the K/V `Where`-scatter.** Inflating the fixed capacity from 256 to
+  16384 positions (64x) costs 4.08ms, i.e. **0.25µs per position**: ~65µs at
+  natural short-context capacity and ~0.7ms at 2541 tokens. It is a real
+  context-length tax (~3% at long context) but not the 5.3ms. Measured with
+  `SINTER_COMPILED_CAPACITY`.
+- **Not per-call overhead on the projections.** Merging q/k/v into one wide
+  matmul (`MergeLinears`, bit-identical — same token ids) removes 20
+  quantized matvecs per token and measured **+0.4%**, i.e. nothing. Reverted
+  rather than kept for the kernel count.
+
+That leaves the rest of the block: two RoPE calls, q/k norms, the transposes,
+the output gate and `o_proj`. Ablating SDPA alone is not a usable probe — it
+made decode *slower* (43.6 vs 65.1 tok/s), because feeding the query straight
+through changes both the layout `o_proj` sees and the downstream MoE routing,
+so the comparison is not like-for-like.
 
 **Closure staging is not a cost — that line was wrong.** The earlier estimate
 of ~1.5ms for staging 30 recurrent states in and out does not survive
@@ -239,11 +253,10 @@ Getting to 100 means making two blocks faster, in this order:
 
 1. **Full attention — 5.3ms for 136MB (26 GB/s), the worst effective
    bandwidth in the model.** 534µs per layer at a context short enough that
-   SDPA itself is trivial, so the cost is in the surrounding ops: the
-   fixed-capacity K/V `Where`-scatter materializes the whole buffer every
-   step (O(capacity), and it grows with the conversation), plus the per-layer
-   mask construction. This is the most promising target because the suspects
-   are structural, not micro-architectural.
+   SDPA itself is trivial. The K/V scatter and the projection call count are
+   both ruled out (measured above), so what is left is the RoPE/norm/gate
+   chain around them — the next thing to bisect, one op group at a time,
+   rather than by ablating SDPA (which is not a like-for-like probe).
 2. **MoE — 7.6ms for 660MB (87 GB/s).** The largest single block. The
    `gather_qmm` slot sweep above says the call is fixed-cost dominated (k=1
    and k=8 cost the same), so the lever is per-call overhead, not bytes.
@@ -373,6 +386,9 @@ Qwen3.5-2B-4bit, same machine: prefill ~1736 tok/s, decode ~141 tok/s
   55.7/55.3 short, 58.6/57.2 vs 50.9/50.2 at 2541 tokens). The difference is
   what the ops loop writes: ~20 intermediates per layer over a 2MB state
   array. Bytes to intermediate buffers is the lever, launch count is not.
+  Merging full attention's q/k/v the same way (bit-identical, 20 fewer
+  matvecs per token) measured **+0.4%** and was reverted — the lever stops
+  paying outside the DeltaNet block.
 - **Op count on small tensors** — 640 extra no-op elementwise ops per token
   (16 per layer) measured 63.0 vs 64.4 tok/s. Free. Fusing the per-layer
   norm chains or the MoE router would therefore buy nothing; the remaining
@@ -477,6 +493,11 @@ SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b
 # Component cost attribution (scratch, SINTER_ABLATE=attn|moe|delta)
 SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \
   go test -count=1 -run TestScratchAblate -v ./llm/qwen35/
+
+# K/V buffer capacity sweep (scratch; SINTER_COMPILED_CAPACITY isolates the
+# O(capacity) scatter cost)
+SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \
+  go test -count=1 -run TestScratchCapacity -v ./llm/qwen35/
 
 # Performance harness (scratch, prints prefill/decode splits)
 SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \

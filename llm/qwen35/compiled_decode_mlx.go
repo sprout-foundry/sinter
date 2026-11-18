@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/sprout-foundry/sinter/llm"
@@ -55,6 +56,21 @@ func roundUpTo(n, m int) int {
 		m = 1
 	}
 	return ((n + m - 1) / m) * m
+}
+
+// compiledCapacity picks the fixed K/V buffer capacity for a generation.
+// SINTER_COMPILED_CAPACITY overrides it (never below what the generation
+// needs), which is how the O(capacity) cost of the in-graph K/V scatter is
+// measured: holding the prompt fixed and inflating the capacity isolates the
+// scatter's traffic from everything else.
+func compiledCapacity(need int) int {
+	natural := roundUpTo(need, compiledGrowStep)
+	if v := os.Getenv("SINTER_COMPILED_CAPACITY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= need {
+			return n
+		}
+	}
+	return natural
 }
 
 // compiledDecode holds one model's compiled decode closure plus its
@@ -95,7 +111,7 @@ func (q *Qwen35) PrepareCompiledDecode(promptLen, maxTokens int, cache *llm.KVCa
 		// Fixed-capacity K/V buffers (capacity rounded to compiledGrowStep):
 		// shapes are constant for the whole generation, so one compilation
 		// serves every step and every op traces with concrete shapes.
-		capacity:    roundUpTo(promptLen+maxTokens, compiledGrowStep),
+		capacity:    compiledCapacity(promptLen + maxTokens),
 		kBufs:       make([]tensor.Array, q.cfg.NumLayers),
 		vBufs:       make([]tensor.Array, q.cfg.NumLayers),
 		deltaStates: make([]tensor.Array, q.cfg.NumLayers),
