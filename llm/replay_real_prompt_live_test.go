@@ -22,6 +22,10 @@ import (
 // on prompts past sliding_window (512) tokens, cold included.
 // Skips without SINTER_MTP_PARITY_MODEL + SINTER_REAL_PROMPT_FILE.
 func TestReplayRealGemmaPrompt(t *testing.T) {
+	// These tests compare prefill paths against each other; a slot restored
+	// from the user's on-disk prefix store would skip the very prefill
+	// under test.
+	t.Setenv("SINTER_PREFIX_DISK", "0")
 	dir := os.Getenv("SINTER_MTP_PARITY_MODEL")
 	promptFile := os.Getenv("SINTER_REAL_PROMPT_FILE")
 	if dir == "" || promptFile == "" {

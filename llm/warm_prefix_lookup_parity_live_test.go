@@ -19,6 +19,10 @@ import (
 // baseline. Any divergence isolates which mechanism corrupts generation.
 // Skips when SINTER_MTP_PARITY_MODEL isn't set.
 func TestWarmPrefixLookupParityLiveModel(t *testing.T) {
+	// These tests compare prefill paths against each other; a slot restored
+	// from the user's on-disk prefix store would skip the very prefill
+	// under test.
+	t.Setenv("SINTER_PREFIX_DISK", "0")
 	dir := os.Getenv("SINTER_MTP_PARITY_MODEL")
 	if dir == "" {
 		t.Skip("SINTER_MTP_PARITY_MODEL not set")

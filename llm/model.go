@@ -97,6 +97,12 @@ type Model struct {
 	spillDirOnce sync.Once
 	spillSeq     uint64
 
+	// prefixStore persists the warm system-prefix slot across process
+	// restarts — see prefix_store.go. nil when persistence is off (no model
+	// directory, or SINTER_PREFIX_DISK=0), in which case every cache hit
+	// comes from the in-memory slots exactly as before.
+	prefixStore *prefixStore
+
 	// GPU work (warmup, Generate, WarmSystemPrefix, Close's cleanup) always
 	// runs on this one dedicated, permanently OS-thread-pinned goroutine —
 	// see runOnGPUThread. MLX's Metal command encoders are thread_local: a
@@ -290,11 +296,12 @@ func NewModelWithBackend(modelDir string, backend tensor.Backend) (*Model, error
 	runtime.GC()
 
 	m := &Model{
-		cfg:       cfg,
-		backend:   backend,
-		stream:    nil, // created per Generate call on the inference thread
-		arch:      arch,
-		tokenizer: tok,
+		cfg:         cfg,
+		backend:     backend,
+		stream:      nil, // created per Generate call on the inference thread
+		arch:        arch,
+		tokenizer:   tok,
+		prefixStore: newPrefixStore(modelDir),
 	}
 	m.initThinking()
 	m.warmupAndPreCache()
@@ -690,6 +697,15 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 	shared, slotIdx := 0, -1
 	if len(tokenIDs) <= m.maxPrefixLenTokens() {
 		shared, slotIdx = m.bestPrefixSlot(tokenIDs, imageKey)
+		if slotIdx < 0 {
+			// No in-memory slot matches. A previous process may have left the
+			// warm system prefix on disk; adopting it turns this cold start's
+			// full prefill into a delta prefill.
+			if idx := m.adoptPersistedSlot(tokenIDs, imageKey); idx >= 0 {
+				slotIdx = idx
+				shared = len(m.prefixSlots[idx].tokens)
+			}
+		}
 	}
 	if os.Getenv("SINTER_LOCAL_DEBUG") == "1" {
 		log.Printf("llm: prefix cache: shared=%d slots=%d matchedSlot=%d newPromptLen=%d images=%d",
@@ -1534,6 +1550,22 @@ func (m *Model) WarmSystemPrefix(prompt string) error {
 		m.stream = s
 		m.arch.SetStream(s)
 
+		// A previous process may have persisted this exact prefix. Restoring
+		// it is the whole point of the store: the system prompt costs a full
+		// prefill on every cold start otherwise. A load failure is not fatal
+		// — fall through and prefill, which is what would have happened
+		// without the store.
+		if m.prefixStore != nil {
+			if entry, path, ok := m.prefixStore.Find(tokenIDs, ""); ok && len(entry.tokens) == len(tokenIDs) {
+				if restored, loadErr := m.prefixStore.Load(path, m.cfg.NumLayers, s, m.backend); loadErr == nil {
+					newIdx := m.storePrefixSlot(-1, entry.tokens, entry.imageKey, entry.posDelta, restored)
+					m.prefixSlots[newIdx].protected = true
+					m.spillIdleSlots(newIdx)
+					return
+				}
+			}
+		}
+
 		cache := NewKVCache(m.cfg.NumLayers, s, m.backend)
 		defer cache.Free()
 
@@ -1550,6 +1582,13 @@ func (m *Model) WarmSystemPrefix(prompt string) error {
 		newIdx := m.storePrefixSlot(-1, tokenIDs, "", 0, snap)
 		m.prefixSlots[newIdx].protected = true
 		m.spillIdleSlots(newIdx)
+
+		// Persist for the next process. Non-fatal: a store that cannot be
+		// written (read-only cache dir, full disk) only costs the next cold
+		// start its prefill.
+		if m.prefixStore != nil {
+			_ = m.prefixStore.Save(prefixStoreEntry{tokens: tokenIDs}, m.prefixSlots[newIdx].cache)
+		}
 	})
 	return warmErr
 }
@@ -1757,6 +1796,32 @@ func (m *Model) spillIdleSlots(keepIdx int) {
 		slot.cache = nil
 		slot.diskPath = path
 	}
+}
+
+// adoptPersistedSlot loads the disk-persisted prefix slot whose entire token
+// sequence is a true prefix of tokenIDs and registers it as an in-memory
+// slot, returning its index (or -1 when nothing matches). This is what makes
+// a fresh process's first turn cheap: the warm system prefix was persisted by
+// a previous run, so the turn delta-prefills instead of paying the full
+// prefill. Must run on the model's dedicated GPU thread, since it allocates
+// GPU arrays.
+//
+// The persisted file is left in place — it is shared with every other
+// process using this model, unlike the temp spill files ensureSlotResident
+// consumes.
+func (m *Model) adoptPersistedSlot(tokenIDs []int, imageKey string) int {
+	if m.prefixStore == nil {
+		return -1
+	}
+	entry, path, ok := m.prefixStore.Find(tokenIDs, imageKey)
+	if !ok {
+		return -1
+	}
+	cache, err := m.prefixStore.Load(path, m.cfg.NumLayers, m.stream, m.backend)
+	if err != nil {
+		return -1
+	}
+	return m.storePrefixSlot(-1, entry.tokens, entry.imageKey, entry.posDelta, cache)
 }
 
 // ensureSlotResident loads the slot at idx back from disk if it was

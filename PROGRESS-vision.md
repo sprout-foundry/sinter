@@ -1,6 +1,6 @@
 # sinter — handoff
 
-Last updated: 2026-11-17 17:05
+Last updated: 2026-11-17 22:05
 
 Vision input works end to end on MLX and GGML, and the bugs that were
 blocking it are fixed and released. This document is the forward plan:
@@ -21,7 +21,8 @@ vision merger's missing biases, sharded-checkpoint `TensorShape`, the
 per-image feature cache, and the image token cap (1024). Then the decode-path
 defaults: pipelined decode is now opt-in and prompt-lookup is off, which
 unlocks compiled decode as the default and is worth 5-10% on every model
-measured.
+measured. Then the cross-restart prefix store (see "Just shipped" below),
+which takes a cold first turn on the 35B from 8.7s to 0.4s.
 
 ## Do this next, in order
 
@@ -128,34 +129,9 @@ product.
 `TestScratchDecodePaths` (also scratch) reports decode-only tok/s for a short
 and a long prompt, which is the cleaner A/B harness for path changes.
 
-### 2. Persist the system-prompt prefix across process restarts
+### 2. Consider lowering the image cap to 512
 
-**Why.** The 2541-token system prompt costs **8489ms** of prefill on the 35B
-(299 tok/s). Prefix reuse already makes later turns cheap (~604ms for a
-~177-token delta), and the timestamp is injected on the *user* message
-(`pkg/agent/seed_query.go`), not the system prompt, so the prefix is stable.
-But a fresh process starts cold and pays the 8.5s again.
-
-**Existing pieces.** `KVCache` already carries `lastHidden`,
-`SnapshotPrefixCopy`, `RestorePrefix`, and a spill file at format version 2
-that includes the hidden state. `CachedHiddenArchitecture` exposes
-`LastHidden` / `LogitsFromHidden`. So the question is whether a restarted
-process can already load a slot, and if not, what is missing — not whether
-the mechanism exists.
-
-**Blockers to respect.** A DeltaNet layer's recurrent state is a single
-accumulated value; the earlier attempt to rewind it produced a plausible but
-wrong answer. The working design keeps the last position's hidden state
-instead of rewinding, so any persistence must store the same thing. The key
-must include model identity, prompt hash and positions, so a stale slot is
-never served to a different model or prompt.
-
-**Target.** Cold-start first turn on the 35B drops from ~8.5s to ~0.1s when
-the system prompt is unchanged.
-
-### 3. Consider lowering the image cap to 512
-
-Only after 1 and 2. `DefaultImageMaxTokens` is 1024
+Only after 1. `DefaultImageMaxTokens` is 1024
 (`llm/openaisserver/multimodal.go`). Dropping to 512 halves image prefill:
 
 | image tokens | 35B prefill | 2B prefill |
@@ -167,6 +143,48 @@ Quality: 495 tokens still transcribed the 1080x2340 screenshot correctly on
 the 2B, and the 4B is fine at every size tested. The risk is dense text and
 small UI labels. This is a quality/latency tradeoff, so it needs a decision,
 not a default flip.
+
+## Just shipped — cross-restart prefix persistence
+
+The 2541-token system prompt used to cost a full prefill on every cold start.
+It now loads from disk instead. `llm/prefix_store.go` persists the warm
+system-prefix KV slot under
+`${SINTER_CACHE_DIR:-${XDG_CACHE_HOME:-~/.cache}/sinter}/prefix/<model
+fingerprint>/`, and both `WarmSystemPrefix` and `Generate` restore it.
+
+35B, `TestScratchColdStart`, same prompt, greedy, separate processes:
+
+| | warm step | first-turn total | tokens |
+|---|---|---|---|
+| cold (empty store) | 8315ms | 8742ms | `[271 17 10 17 283 220 19]` |
+| warm (restored) | 36ms | 395ms | `[271 17 10 17 283 220 19]` |
+
+**Identical token ids** are the correctness proof: a restored DeltaNet state
+that differed from the prefilled one would change them. The 116MB slot file
+reads back in ~40ms (unified memory, so the "upload" is a memcpy).
+
+Design constraints worth keeping:
+
+- **Only the warm prefix is persisted.** Persisting each conversation's own
+  slot would rewrite hundreds of megabytes per turn for a hit the in-memory
+  slots already serve.
+- **Matching is stricter than a hash.** The stored token sequence is compared
+  exactly and must be a true prefix; `imageKey` and `posDelta` must match
+  too. A partial overlap is never served, for the same reason
+  `bestPrefixSlot` refuses one.
+- **The fingerprint covers the code, not just the weights.** It hashes
+  `config.json` and `tokenizer.json`, plus each safetensors shard's name,
+  size and mtime, plus `prefixCacheEpoch`. Bump that constant on any change
+  to rope, norms or the recurrent kernel — the weights would fingerprint
+  identically while the stored K/V went stale.
+- **A bad file is a cache miss, never an error.** Fingerprint mismatch,
+  wrong layer count, truncated payload and an absurd declared token count all
+  fall through to a normal prefill.
+- **`SINTER_PREFIX_DISK=0`** disables it; `SINTER_CACHE_DIR` relocates the
+  root (the live tests use the former to stay hermetic).
+
+Not done, and not needed yet: persisting a conversation's own prefix, and
+compressing the slot (fp16 would halve the 116MB).
 
 ## Measured baseline — do not re-measure
 
@@ -253,6 +271,17 @@ Qwen3.5-2B-4bit, same machine: prefill ~1736 tok/s, decode ~141 tok/s
   clean HEAD. Because it takes the process down, a multi-package
   `-tags ggml` run reports unrelated packages as FAIL; run packages
   individually.
+- **Under `-tags ggml`, two large-image tests also crash on clean HEAD**
+  with `fault 0x187d3c5e8`: `TestImageCacheHitSkipsPrefill`
+  (`llm/mropeparity`) and `TestImageRequestLiveModel`
+  (`llm/openaisserver`). Same instability as the large-image abort below,
+  not a regression — verified by stashing to clean HEAD and reproducing.
+- **The `llm` package's own tests import only the MLX backend**, so
+  `go test -tags ggml ./llm/` fails four tests with "no GPU backend
+  available" (`TestGeneration`, `TestCacheDecodeParity`,
+  `TestPrefixCacheParity`, `TestPrefixCacheSpeedsUp`). Test the `llm`
+  package on MLX; use the ggml tags for `llm/vision`, `llm/mropeparity` and
+  `llm/openaisserver`.
 - **Benchmark on a quiet machine.** Every decode number in this document is
   decode-only tok/s from a greedy run. A concurrent `tsc --noEmit` or a
   transcription job moved the same measurement by 2x, and load average above
@@ -277,6 +306,13 @@ SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b
 # Performance harness (scratch, prints prefill/decode splits)
 SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \
   go test -count=1 -run TestScratchPerfProfile -v ./llm/qwen35/
+
+# Cold-start A/B for the prefix store (scratch). Run twice against the same
+# SINTER_CACHE_DIR: the first run populates the store, the second restores.
+# Add SINTER_COLDSTART_NO_WARM=1 to exercise Generate's own adoption path.
+SINTER_CACHE_DIR=/tmp/sprout/prefix-ab SINTER_BACKEND=metal \
+SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \
+  go test -count=1 -run TestScratchColdStart -v ./llm/qwen35/
 
 # Image cap end to end over HTTP (scratch)
 SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/Qwen3.5-2B-4bit \

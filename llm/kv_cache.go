@@ -613,8 +613,15 @@ func (c *KVCache) SaveToDisk(path string) (err error) {
 			err = cerr
 		}
 	}()
+	return c.WriteSpill(f)
+}
 
-	w := bufio.NewWriter(f)
+// WriteSpill serializes the cache's raw arrays to out in the spill format. It
+// is what SaveToDisk writes to a file, exposed separately so a caller can
+// embed the payload inside its own container (see prefix_store.go). Does
+// not modify or free c's arrays.
+func (c *KVCache) WriteSpill(out io.Writer) error {
+	w := bufio.NewWriter(out)
 	if _, err := w.Write(kvSpillMagic[:]); err != nil {
 		return err
 	}
@@ -709,14 +716,20 @@ func LoadKVCacheFromDisk(path string, s tensor.Stream, backend tensor.Backend) (
 		return nil, fmt.Errorf("kv_cache: open %s: %w", path, err)
 	}
 	defer f.Close()
+	return ReadSpill(f, s, backend)
+}
 
-	r := bufio.NewReader(f)
+// ReadSpill reconstructs a cache from the spill format, reading from r. It is
+// the reader half of WriteSpill, exposed so a caller that wraps the payload
+// in its own container can decode it (see prefix_store.go).
+func ReadSpill(r io.Reader, s tensor.Stream, backend tensor.Backend) (_ *KVCache, err error) {
+	r = bufio.NewReader(r)
 	var magic [4]byte
 	if _, err := io.ReadFull(r, magic[:]); err != nil {
 		return nil, fmt.Errorf("kv_cache: read magic: %w", err)
 	}
 	if magic != kvSpillMagic {
-		return nil, fmt.Errorf("kv_cache: %s is not a spilled cache file", path)
+		return nil, fmt.Errorf("kv_cache: not a spilled cache payload")
 	}
 	var version, numLayers uint32
 	if err := binary.Read(r, binary.LittleEndian, &version); err != nil {
