@@ -84,6 +84,16 @@ so the model runs at roughly a quarter of peak bandwidth and **no single
 block is close to its own floor**: the MoE moves 660MB in 7.6ms (87 GB/s),
 full attention 136MB in 5.3ms (26 GB/s).
 
+**Block-level ablations do not decompose — do not bisect inside a block.**
+The full-attention block measures 5.3ms, but every part of it measures near
+zero: merging q/k/v into one matvec is +0.4%, ablating `o_proj` is -0.3%
+(noise), ablating SDPA is 0.46ms, and the K/V scatter is 65µs. That sums to
+~0.5ms against a 5.3ms block. Removing a block shortens the dependency chain
+feeding the next block's MoE router, so what the block-level number captures
+is partly critical-path latency, not work. Use these numbers to rank blocks,
+not to locate a kernel; per-kernel GPU counters are the only thing that
+resolves inside a block.
+
 **This replaces the earlier floor-table estimates, which were wrong by 2-5x**
 and pointed at the wrong blocks. Two in particular:
 
@@ -252,11 +262,10 @@ already sum to the total, and there is no unaccounted slack to reclaim.
 Getting to 100 means making two blocks faster, in this order:
 
 1. **Full attention — 5.3ms for 136MB (26 GB/s), the worst effective
-   bandwidth in the model.** 534µs per layer at a context short enough that
-   SDPA itself is trivial. The K/V scatter and the projection call count are
-   both ruled out (measured above), so what is left is the RoPE/norm/gate
-   chain around them — the next thing to bisect, one op group at a time,
-   rather than by ablating SDPA (which is not a like-for-like probe).
+   bandwidth in the model.** Every sub-block of it measures near zero, so the
+   block-level number is mostly critical-path latency (see the non-additivity
+   note above) — which means the fix may not be inside attention at all.
+   Per-kernel counters are needed before spending more here.
 2. **MoE — 7.6ms for 660MB (87 GB/s).** The largest single block. The
    `gather_qmm` slot sweep above says the call is fixed-cost dominated (k=1
    and k=8 cost the same), so the lever is per-call overhead, not bytes.
