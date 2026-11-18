@@ -24,6 +24,46 @@ unlocks compiled decode as the default and is worth 5-10% on every model
 measured. Then the cross-restart prefix store (see "Just shipped" below),
 which takes a cold first turn on the 35B from 8.7s to 0.4s.
 
+## Engine comparison — mlx-lm is 18-22% faster on identical weights
+
+Measured on the same machine, same model directories, greedy decoding:
+
+| engine | 4B | 35B-A3B | notes |
+|---|---|---|---|
+| **mlx-lm** (Python) | **98.8** | **76.0** | no `mx.compile` at all; `mx.async_eval` pipelining |
+| sinter (compiled) | ~81 | ~63 | current default |
+| sinter (eager) | — | 56.1 | `SINTER_COMPILED_DECODE=0` |
+| llama.cpp (Q4_K_M) | 67.4 | n/a | `llama-bench`, 4B GGUF |
+
+The gap is consistent across both models, so it is systemic, not one block.
+Two things follow from it.
+
+**mlx-lm does not compile.** Its `generate_step` calls the model eagerly and
+pipelines with `mx.async_eval` — compute the next token while the CPU samples
+the current one. So sinter's compiled path (63) is 17% behind an *uncompiled*
+reference (76), which means compilation is not where the remaining headroom
+is, and sinter's own `SINTER_PIPELINE_DECODE=1` is not equivalent: it measures
+56.1, exactly the eager number, so it is not overlapping anything.
+
+**What mlx-lm does differently in the hot path.** Its `KVCache` mutates the
+buffer in place (`self.keys[..., prev:offset, :] = keys`) and returns a slice
+of exactly `offset` positions, so at decode it passes **no attention mask**.
+sinter over-allocates the buffer to a fixed capacity for compilation and must
+pass an additive array mask in every full-attention layer. Dropping the mask
+in the chain harness is worth 64µs/block (309 -> 245µs, 0.64ms/token), and
+the full-capacity `Where` scatter adds ~0.29ms — together ~6% of the step,
+real but not the whole 18%.
+
+Its MoE and DeltaNet are otherwise *less* optimized than sinter's: mlx-lm
+issues four separate DeltaNet input projections where sinter merges them into
+one, and two `gather_qmm` calls where sinter merges gate/up into one. So the
+remaining gap is not in those blocks' structure.
+
+**Dead end for this comparison.** llama.cpp is slower than both on the 4B
+(67.4 vs 81 vs 98.8), so it is not the tool to chase. Note its quant is
+Q4_K_M rather than MLX 4-bit, so treat it as an order-of-magnitude check, not
+a like-for-like one.
+
 ## Do this next, in order
 
 ### 1. Close the remaining decode gap — it is not launch overhead

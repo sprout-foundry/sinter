@@ -340,7 +340,15 @@ func (q *Qwen35) compiledFullAttentionLayer(h tensor.Array, lw *layerWeights, po
 	defer mask4.Free()
 
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
-	ctx, err := b.FastScaledDotProductAttention(qRot, kUpd, vUpd, scale, "array", mask4, nil, s)
+	var attnMask tensor.Array = mask4
+	if os.Getenv("SINTER_ATTN_NOMASK") == "1" {
+		// Scratch ablation: drop the additive mask. Numerically wrong against
+		// a capacity-sized buffer (it attends to padding), but it isolates
+		// what the mask costs MLX's SDPA path — mlx-lm passes no mask at
+		// decode because its cache holds exactly `offset` positions.
+		attnMask = nil
+	}
+	ctx, err := b.FastScaledDotProductAttention(qRot, kUpd, vUpd, scale, "array", attnMask, nil, s)
 	if err != nil {
 		kUpd.Free()
 		vUpd.Free()
