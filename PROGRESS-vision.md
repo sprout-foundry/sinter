@@ -84,6 +84,32 @@ so the model runs at roughly a quarter of peak bandwidth and **no single
 block is close to its own floor**: the MoE moves 660MB in 7.6ms (87 GB/s),
 full attention 136MB in 5.3ms (26 GB/s).
 
+**The MoE block is dominated by the two routed-expert gathers.** Chained the
+same way (`TestScratchMoeChain`, `SINTER_MOE_VARIANT` for the sub-groups),
+the block is 270-300µs, and the variants separate it:
+
+| group | µs/block | share |
+|---|---|---|
+| routed experts (gate_up + down gathers) | ~140-155 | ~52% |
+| shared expert (3 matvecs) | 25-40 | ~12% |
+| router chain | 13-28 | ~7% |
+| residual (weighting, sum, reshapes) | ~60 | ~20% |
+
+The routed gathers read 12.6MB of the block's 14.4MB at **90 GB/s**, 4.4x off
+the floor, and the doc's earlier k=1..16 sweep showed the call is
+fixed-cost-dominated rather than bandwidth-bound. That makes them the single
+largest op group in the model (~5.6ms/token isolated across 40 layers) and
+the biggest remaining target — but the cost is inside MLX's `gather_qmm`, so
+a Go-level change cannot reach it. `sorted_indices` is the documented
+performance hint and is currently passed false; testing it needs an argsort
+binding sinter does not have, and the flat k-sweep suggests index handling is
+not what costs the time.
+
+The router is confirmed negligible (13-28µs), and ablating the score
+weighting and the sum over the expert axis changes nothing (292 vs 299µs), so
+the residual is run-to-run variance and non-additivity rather than a real op
+group.
+
 **Block-level ablations do not decompose — do not bisect inside a block.**
 The full-attention block measures 5.3ms, but every part of it measures near
 zero: merging q/k/v into one matvec is +0.4%, ablating `o_proj` is -0.3%
@@ -281,15 +307,19 @@ Getting to 100 means making two blocks faster, in this order:
    off its 400 GB/s floor. Bisecting it needs env-gated variants of the block
    measured as 100-iteration chains (`TestScratchAttnChain`); per-op timing
    and in-model sub-ablations both fail here, for the reasons above.
-2. **MoE — 7.6ms for 660MB (87 GB/s).** The largest single block. The
-   `gather_qmm` slot sweep above says the call is fixed-cost dominated (k=1
-   and k=8 cost the same), so the lever is per-call overhead, not bytes.
+2. **MoE — 7.6ms in-model; ~140-155µs/block isolated, of which the two
+   routed-expert gathers are ~52%.** The largest single op group in the model
+   (~5.6ms/token isolated across 40 layers), reading 12.6MB at 90 GB/s. The
+   `gather_qmm` slot sweep says the call is fixed-cost dominated (k=1 and k=8
+   cost the same), so the lever is per-call overhead, not bytes — and that
+   overhead is inside MLX, not reachable from Go. `sorted_indices` is the one
+   documented hint still untested; it needs an argsort binding.
 
 Both need per-kernel GPU counters to separate occupancy from access pattern.
-The Metal System Trace used above has the Shader Timeline disabled, so it
-gives coverage but not per-kernel attribution — re-record with that enabled,
-or use Xcode's Metal debugger on a smaller model, because the 35B's
-`.gputrace` is not openable on a 64GB machine.
+The Metal System Trace has the Shader Timeline disabled and xctrace exposes
+no option to enable it, so it gives coverage but not per-kernel attribution.
+Xcode's Metal debugger is the only route, and the 35B's `.gputrace` is not
+openable on a 64GB machine — use a smaller model there.
 
 The capture path is verified working — see the command in Verified
 commands. It needs `MTL_CAPTURE_ENABLED=1`, which the earlier attempt was
@@ -522,6 +552,11 @@ SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b
 # per-kernel counters — 100 chained iterations, one eval)
 SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \
   go test -count=1 -run TestScratchAttnChain -v ./llm/qwen35/
+
+# MoE block chain (scratch; SINTER_MOE_VARIANT=norouted|norouter|noshared|nosum
+# bisects its op groups)
+SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \
+  go test -count=1 -run TestScratchMoeChain -v ./llm/qwen35/
 
 # K/V buffer capacity sweep (scratch; SINTER_COMPILED_CAPACITY isolates the
 # O(capacity) scatter cost)

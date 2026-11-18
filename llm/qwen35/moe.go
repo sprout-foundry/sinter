@@ -4,6 +4,7 @@ package qwen35
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/sprout-foundry/sinter/llm"
@@ -253,6 +254,12 @@ func (m *sparseMoeBlock) router(xFlat tensor.Array, b tensor.Backend, s tensor.S
 //  5. y = switch_mlp(x, inds) * scores      [B, S, hidden]
 //  6. shared_y = sigmoid(shared_expert_gate(x)) * shared_expert(x)
 //  7. y = y + shared_y
+// moeVariant reports which internal op group the scratch SINTER_MOE_VARIANT
+// diagnostic switches off. Each variant keeps the block's output shape so the
+// surrounding chain traces unchanged; numerics change, so these are
+// timing-only experiments.
+func moeVariant(what string) bool { return os.Getenv("SINTER_MOE_VARIANT") == what }
+
 func (m *sparseMoeBlock) forward(x tensor.Array, q *Qwen35) (tensor.Array, error) {
 	s := q.stream
 	b := q.backend
@@ -269,9 +276,24 @@ func (m *sparseMoeBlock) forward(x tensor.Array, q *Qwen35) (tensor.Array, error
 	BS := xFlat.Shape()[0]
 
 	// --- Router ---
-	inds, scores, err := m.router(xFlat, b, s)
-	if err != nil {
-		return nil, err
+	var inds, scores tensor.Array
+	if moeVariant("norouter") {
+		// Scratch ablation: replace the router chain (gate matvec, softmax,
+		// argpartition, slice, take-along-axis, sum, divide) with constants.
+		inds, err = b.Zeros([]int{BS, k}, tensor.Int32, s)
+		if err != nil {
+			return nil, fmt.Errorf("moe ablation inds: %w", err)
+		}
+		scores, err = b.Zeros([]int{BS, k}, tensor.BFloat16, s)
+		if err != nil {
+			inds.Free()
+			return nil, fmt.Errorf("moe ablation scores: %w", err)
+		}
+	} else {
+		inds, scores, err = m.router(xFlat, b, s)
+		if err != nil {
+			return nil, err
+		}
 	}
 	defer inds.Free()
 	defer scores.Free()
@@ -282,6 +304,24 @@ func (m *sparseMoeBlock) forward(x tensor.Array, q *Qwen35) (tensor.Array, error
 		return nil, err
 	}
 	defer sharedOut.Free()
+
+	if moeVariant("norouted") {
+		// Scratch ablation: skip the routed experts entirely (both gathers,
+		// the SwiGLU between them, and the score weighting).
+		if len(xShape) == 3 {
+			return b.Reshape(sharedOut, xShape, s)
+		}
+		return sharedOut, nil
+	}
+	if moeVariant("noshared") {
+		// Scratch ablation: skip the always-on shared expert. It is replaced
+		// by zeros of the same shape so the final add still traces.
+		sharedOut.Free()
+		sharedOut, err = b.Zeros([]int{BS, lastDim}, tensor.BFloat16, s)
+		if err != nil {
+			return nil, fmt.Errorf("moe ablation shared: %w", err)
+		}
+	}
 
 	// --- Routed experts via gather_qmm ---
 	// x must be [BS, 1, 1, H]: the lhs batch dims [BS, 1] broadcast against
@@ -348,6 +388,30 @@ func (m *sparseMoeBlock) forward(x tensor.Array, q *Qwen35) (tensor.Array, error
 	defer downOut.Free()
 
 	// downOut shape: [BS, k, 1, H]
+	if moeVariant("nosum") {
+		// Scratch ablation: skip the score weighting and the sum over the
+		// expert axis, taking expert 0's slice instead. Isolates the
+		// elementwise/sum overhead from the gathers themselves.
+		sliced, err := b.Slice(downOut, []int{0, 0, 0, 0}, []int{BS, 1, 1, lastDim}, []int{1, 1, 1, 1}, s)
+		if err != nil {
+			return nil, fmt.Errorf("moe ablation slice: %w", err)
+		}
+		defer sliced.Free()
+		routedOut, err := b.Reshape(sliced, []int{BS, lastDim}, s)
+		if err != nil {
+			return nil, fmt.Errorf("moe ablation reshape: %w", err)
+		}
+		defer routedOut.Free()
+		result, err := b.Add(routedOut, sharedOut, s)
+		if err != nil {
+			return nil, fmt.Errorf("moe add shared: %w", err)
+		}
+		if len(xShape) == 3 {
+			return b.Reshape(result, xShape, s)
+		}
+		return result, nil
+	}
+
 	// Weight by scores: scores [BS, k] → [BS, k, 1, 1] to broadcast over H
 	scoreWeights, err := b.Reshape(scores, []int{BS, k, 1, 1}, s)
 	if err != nil {
