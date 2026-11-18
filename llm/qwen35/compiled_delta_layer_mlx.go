@@ -21,28 +21,13 @@ func (q *Qwen35) compiledDeltaLayer(x tensor.Array, g *gatedDeltaNet, stateIn []
 
 	B, S := 1, 1
 
-	qkv, err := g.inProjQKV.Forward(x, b, s)
+	qkv, z, bOut, a, err := g.inProjections(x, b, s)
 	if err != nil {
-		return nil, nil, fmt.Errorf("in_proj_qkv: %w", err)
+		return nil, nil, err
 	}
 	defer qkv.Free()
-
-	z, err := g.inProjZ.Forward(x, b, s)
-	if err != nil {
-		return nil, nil, fmt.Errorf("in_proj_z: %w", err)
-	}
 	defer z.Free()
-
-	bOut, err := g.inProjB.Forward(x, b, s)
-	if err != nil {
-		return nil, nil, fmt.Errorf("in_proj_b: %w", err)
-	}
 	defer bOut.Free()
-
-	a, err := g.inProjA.Forward(x, b, s)
-	if err != nil {
-		return nil, nil, fmt.Errorf("in_proj_a: %w", err)
-	}
 	defer a.Free()
 
 	// Convolution over the cached rows + this token.

@@ -1,6 +1,6 @@
 # sinter — handoff
 
-Last updated: 2026-11-17 15:40
+Last updated: 2026-11-17 17:05
 
 Vision input works end to end on MLX and GGML, and the bugs that were
 blocking it are fixed and released. This document is the forward plan:
@@ -9,7 +9,8 @@ established so they are not repeated.
 
 ## Where things stand
 
-- **sinter v0.8.2** is tagged and pushed. `main` is in sync with origin.
+- **sinter v0.8.2** is tagged and pushed. `main` carries the decode-path
+  default change below (unreleased).
 - **sprout** is on `sinter v0.8.2`, committed and pushed to `main`; publishing
   the sprout release is the owner's step.
 - MLX is the product path (M1 Max, 64GB, 400 GB/s). GGML is secondary and has
@@ -17,58 +18,85 @@ established so they are not repeated.
 
 Shipped in this stretch: the MLX header/ABI fix, three bugs it unmasked, the
 vision merger's missing biases, sharded-checkpoint `TensorShape`, the
-per-image feature cache, and the image token cap (1024).
+per-image feature cache, and the image token cap (1024). Then the decode-path
+defaults: pipelined decode is now opt-in and prompt-lookup is off, which
+unlocks compiled decode as the default and is worth 5-10% on every model
+measured.
 
 ## Do this next, in order
 
-### 1. Fuse the decode layer — the biggest win
+### 1. Close the remaining decode gap — it is not launch overhead
 
-**Why.** Decode is overhead-bound, not bandwidth-bound. On the 35B MoE
-(3B active), decode runs at ~47 tok/s while pulling only ~70 GB/s of the
-400 GB/s available — roughly 5x theoretical headroom. The 2B sits at
-~100 tok/s, also far under its bandwidth ceiling. With 40 layers and roughly
-15 kernel launches each, per-token launch overhead is the plausible
-dominant cost.
+**Status: the diagnosis is done; the fix is not.** Compiled decode used to be
+dead code: `useCompiled` requires `!usePipelined`, and pipelined decode was
+default-ON, so `SINTER_COMPILED_DECODE=0` changed nothing (which is exactly
+what the earlier 47.3 vs 47.2 tok/s measured). Pipelined is now opt-in, so
+compiled runs by default and wins:
 
-**Do not start by writing kernels.** First establish whether the existing
-compiled-decode path engages at all, because the measurements say it is
-currently doing nothing:
+| model | eager | compiled | gain |
+|---|---|---|---|
+| qwen3.6-35b-a3b-4bit, short ctx | 54.4/54.6 | 58.8/59.1 | +8% |
+| qwen3.6-35b-a3b-4bit, 2541 tok | 43.3/45.7 | 50.5/48.8 | +10% |
+| Qwen3.5-2B-4bit | 123-130 | 140-142 | +10% |
+| qwen3.5-4b-4bit | 73.7-74.5 | 77.8-79.2 | +5% |
 
-- `SINTER_COMPILED_DECODE=0` vs default changed decode by 0.1 tok/s
-  (47.3 vs 47.2) on the 35B.
-- No `compiled decode unavailable (...)` line was ever logged, which is what
-  `llm/model.go:940` prints when `PrepareCompiledDecode` fails.
-- So either `useCompiled` is false (the conditions at `llm/model.go:936-938`
-  are not met) or the compiled closure is being built but not helping.
+The DeltaNet block's four input projections (`in_proj_qkv`, `_z`, `_b`, `_a`)
+now load as one merged wide matmul (`llm.MergeLinears`, split back with
+constant-bounded slices). Output is bit-identical, and it is worth another
++3%: 35B 58.8/59.1 → 60.1/61.0/61.2 tok/s, 4B 77.8/79.2 → 80.5/81.4, 2B a
+wash. Prefill is unchanged (8261ms for the 2541-token prompt).
 
-Check, in this order: does `*Qwen35` satisfy `CompiledGreedyArchitecture`;
-does `PrepareCompiledDecode` actually run (`llm/qwen35/compiled_decode_mlx.go`);
-and does `q.cd` end up non-nil. Note `useGPUArgmax` requires
-`Temperature <= 0` **and** `RepetitionPenalty == 0`, and
-`DefaultGenerateConfig` sets `RepetitionPenalty: 1.1` — so a default-config
-call takes none of the fast paths. That was a measurement trap once already.
+**Launch overhead is ruled out as the dominant cost.** MLX's kernel fusion on
+top of compile (`SINTER_COMPILED_DECODE_MODE=fuse`) measured 54.8/50.3 at short
+context and 45.2/45.6 at 2541 tokens — no better than eager. Replay alone is
+what pays: 160 chained elementwise ops cost 2.0ms eager and 0.37ms compiled.
+And the merge experiment shows kernel COUNT is not the lever either: a
+standalone benchmark made 4 qmm look 5x slower than 1 merged qmm, but in the
+real single-command-buffer graph the same change is worth 3%. Standalone
+per-call timings on this machine overstate by 3-4x because each AsyncEval
+commits its own command buffer — do not trust them for absolute cost.
 
-**Then.** Existing scaffolding to build on, not to duplicate:
+**Where the ~16ms/token actually goes** (35B, short context, compiled):
 
-- `llm/qwen35/compiled_decode_mlx.go` — the `mlx_compile` closure over a
-  fixed-capacity KV window.
-- `llm/qwen35/compiled_decode_body_mlx.go` — the traced body.
-- `llm/qwen35/compiled_delta_layer_mlx.go` — mirrors `gatedDeltaNet.forward`
-  at S=1 with the recurrent state as explicit I/O.
-- `llm/qwen35/fused_kernels.go` — `fusedComputeG`, `fusedGatedDeltaUpdate`.
-- `mlx/` — the `mlx_fast_*` wrappers and the generated dispatch shim.
+- weight reads ~1669MB/token (1383MB across 40 layers + 286MB `lm_head`)
+- MoE (40 layers): 3.1ms for 660MB — 213 GB/s, already dense-equivalent, so
+  the expert dispatch is NOT the problem. The router chain is inside the noise
+- linear attention (30 layers): ~4.5ms, of which ~2.9ms is the projections
+  (now merged) and the rest is the recurrent kernel, conv and norms
+- vocabulary head: 2.0ms (286MB, 143 GB/s); argmax over 248k vocab: 0.5ms
+- elementwise norms and residual adds: ~0.4ms under compile (2.2ms eager)
+- compiled-closure staging: ~1.5ms (30 recurrent states, 2MB fp32 each,
+  crossing the closure boundary in and out every step)
 
-The direction that matches the diagnosis is covering a whole layer per
-launch rather than one op per launch, starting with the DeltaNet layers
-(30 of 40) where `compiled_delta_layer_mlx.go` already has the shape.
+Summing the parts gives ~11.5ms of real work, i.e. a ~87 tok/s ceiling with
+the current kernels. That is why the target below is not reachable by
+rearranging kernels.
 
-**Target.** >100 tok/s on the 35B, and a measurable gain on the 2B. Anything
-smaller means the launches were not the cost, and the next suspect is the
-MoE expert dispatch (`gather_qmm` in `llm/qwen35/moe.go`).
+**Next lever: the recurrent kernel's parallelism.** `fusedGatedDeltaUpdate`
+launches 32 x-threads per (head, dv) and gives each thread a 4-element serial
+reduction over Dk. In isolation it measures 0.226ms/layer (17.7 GB/s), against
+a 4MB state round-trip that should take ~10µs — but see the caveat above, so
+that number needs an in-situ measurement (Metal capture, or a layer-skip
+ablation) before rewriting the kernel. If it does hold up, the fix is to give
+each thread fewer state elements and reduce across more threads.
+
+**Target.** >100 tok/s on the 35B. At dense-equivalent bandwidth the 35B would
+run at ~120 tok/s; the sum of parts says ~87 with these kernels, so closing
+the rest needs the recurrent kernel and the vocabulary head to get faster, not
+another scheduling change.
+
+**Consumer follow-up.** sprout's `pkg/localmodel/local_provider_chat.go` sets
+`PromptLookupMaxDrafts = 6` in two places, so production still takes the
+prompt-lookup path even though it now measures slower than compiled decode.
+Removing those two assignments (and bumping sprout onto the sinter release
+that carries the new defaults) is what actually delivers the 5-10% in the
+product.
 
 **Measure with** `llm/qwen35/zz_perf_test.go` (gitignored scratch):
 `TestScratchPerfProfile` prints prefill/decode splits for a short turn, a
 2541-token system prompt, a growing conversation, and an image request.
+`TestScratchDecodePaths` (also scratch) reports decode-only tok/s for a short
+and a long prompt, which is the cleaner A/B harness for path changes.
 
 ### 2. Persist the system-prompt prefix across process restarts
 
@@ -112,34 +140,42 @@ not a default flip.
 
 ## Measured baseline — do not re-measure
 
-qwen3.6-35b-a3b-4bit on M1 Max:
+qwen3.6-35b-a3b-4bit on M1 Max, compiled decode (the current default):
 
 | scenario | prefill | decode |
 |---|---|---|
-| short turn | 94ms | 37 tok/s |
+| short turn | 94ms | 61 tok/s |
 | system prompt, 2541 tok | 8489ms (299 tok/s) | — |
-| conv delta, ~177 tok | 604ms | 47 tok/s |
+| conv delta, ~177 tok | 604ms | 49 tok/s |
 | image, 987 tok | 4055ms | 21.7 tok/s |
 
-Qwen3.5-2B-4bit, same machine: prefill ~1736 tok/s, decode ~100 tok/s,
-image 987 tok → 1369ms.
-
-Of the 35B image prefill, roughly 3.3s is text and ~0.75s is the vision
-tower, so the token count dominates the tower.
+Qwen3.5-2B-4bit, same machine: prefill ~1736 tok/s, decode ~141 tok/s
+(compiled), image 987 tok → 1369ms. qwen3.5-4b-4bit: 81 tok/s (compiled).
 
 **Already ruled out by measurement:**
 
 - **Prefill chunk size** — swept 128→4096 in the code comments; throughput is
   flat. It is a memory knob, not a speed knob.
-- **Compiled decode** — on/off identical (see step 1).
+- **Compiled decode** — it was never running (see step 1). Now default-ON and
+  worth 5-10%.
+- **Kernel fusion** — `SINTER_COMPILED_DECODE_MODE=fuse` is no better than
+  eager at either context length. Launch count is not the bottleneck.
+- **Pipelined decode** — slower than compiled on all three models
+  (35B 52.6/53.0, 2B 112.3/116.3, 4B 75.3/75.3). Now opt-in via
+  `SINTER_PIPELINE_DECODE=1`.
+- **Prompt-lookup** — slower than compiled even on verbatim-echo prompts
+  (35B 51.6-53.8 at k=4 and k=6, 2B 106-114). Instrumented: 362 of 414 decode
+  steps found no n-gram candidate, so the search and verify batches cost more
+  than the accepted drafts save. `openaisserver` no longer enables it.
+- **MoE expert dispatch** — 213 GB/s, dense-equivalent. The router chain is
+  inside the noise.
+- **Kernel count** — merging the four DeltaNet input projections into one
+  matmul (bit-identical) is worth 3%, not the 5x a standalone benchmark
+  suggests. Fewer kernels is not the lever.
 - **Sampling path** — greedy/no-penalty vs the defaults is identical, so CPU
-  argmax over the 248k vocab is not the cost.
+  argmax over the 248k vocab is not the cost (argmax itself is 0.5ms).
 - **MTP** — none of the three checkpoints (`Qwen3.5-2B-4bit`,
   `qwen3.5-4b-bf16`, `qwen3.6-35b-a3b-4bit`) ships MTP tensors.
-- **MoE routing** — already batched through `gather_qmm`.
-- **Prompt lookup** — attempted, but the harness generated zero tokens, so
-  the result is inconclusive rather than negative. Worth a better harness if
-  copy-heavy agent output is the target.
 
 ## Don't redo
 
@@ -170,6 +206,9 @@ tower, so the token count dominates the tower.
 - **`zz_*_test.go` is gitignored.** Scratch diagnostics live on disk but
   never get committed. `llm/qwen35/zz_blocks_test.go` is the per-block tower
   comparison that found the merger bug; keep it.
+  `llm/qwen35/zz_towerparity_test.go` fails against a stale
+  `/tmp/sprout/refdump` (2048 vs 2560 hidden) — it is a dump-version mismatch,
+  not a regression.
 - **`TestNoLegacyHomeDotSprout`** (sprout `pkg/configuration`) flakes when a
   live sprout session creates/removes `.sprout/revisions` dirs while the
   guard walks the tree. Passes on re-run; unrelated to dependency bumps.
@@ -184,6 +223,13 @@ tower, so the token count dominates the tower.
   clean HEAD. Because it takes the process down, a multi-package
   `-tags ggml` run reports unrelated packages as FAIL; run packages
   individually.
+- **Benchmark on a quiet machine.** Every decode number in this document is
+  decode-only tok/s from a greedy run. A concurrent `tsc --noEmit` or a
+  transcription job moved the same measurement by 2x, and load average above
+  ~10 makes the numbers unusable. Check `sysctl -n vm.loadavg` first.
+- **`ThinkingTokens` defaults to false**, so a prompt that makes the model
+  think emits zero tokens through `onToken` and a scratch harness reports
+  "0 tok". Set `cfg.ThinkingTokens = true` in harnesses that count tokens.
 
 ## Verified commands
 
@@ -192,7 +238,11 @@ go build ./... && go build -tags ggml ./...
 
 # MLX
 SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/Qwen3.5-2B-4bit \
-  go test -count=1 ./llm/qwen35/ ./llm/ ./mlx/
+  go test -count=1 ./llm/qwen35/ ./llm/ ./mlx/ ./llm/openaisserver/
+
+# Decode-path A/B (scratch, decode-only tok/s, short and long prompt)
+SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \
+  go test -count=1 -run TestScratchDecodePaths -v ./llm/qwen35/
 
 # Performance harness (scratch, prints prefill/decode splits)
 SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \

@@ -106,6 +106,119 @@ func (l *Linear) Free() {
 	freeArr(l.bias)
 }
 
+// MergeLinears concatenates projections that read the same input into one
+// wider projection, so a single matmul replaces several that each stream the
+// same activations. At decode shape every projection is a separate kernel
+// launch, and the launch dominates the (small) memory transfer, so this is
+// the difference between four kernels and one per block.
+//
+// Output rows appear in the order the parts are given: the caller splits the
+// result along the last axis at the same boundaries. The merged projection is
+// bit-identical to the separate ones — each output row's accumulation is
+// independent of the others.
+//
+// Returns an error, leaving the parts untouched, when they cannot share a
+// kernel: mixed quantization, differing quant parameters, or a bias on only
+// some of them.
+func MergeLinears(b tensor.Backend, s tensor.Stream, parts ...*Linear) (*Linear, error) {
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("merge linears: need at least two projections")
+	}
+	quantized, full := 0, 0
+	for _, p := range parts {
+		if p == nil {
+			return nil, fmt.Errorf("merge linears: nil projection")
+		}
+		if p.qW != nil {
+			quantized++
+		}
+		if p.wT != nil {
+			full++
+		}
+	}
+	if quantized != 0 && full != 0 {
+		return nil, fmt.Errorf("merge linears: mixed quantized and full-precision projections")
+	}
+
+	out := &Linear{}
+	switch {
+	case quantized == len(parts):
+		first := parts[0]
+		for _, p := range parts[1:] {
+			if p.qGroupSize != first.qGroupSize || p.qBits != first.qBits || p.qMode != first.qMode {
+				return nil, fmt.Errorf("merge linears: quant parameters differ")
+			}
+		}
+		ws := make([]tensor.Array, len(parts))
+		scales := make([]tensor.Array, len(parts))
+		biases := make([]tensor.Array, len(parts))
+		for i, p := range parts {
+			ws[i], scales[i], biases[i] = p.qW, p.qScales, p.qBiases
+		}
+		var err error
+		if out.qW, err = b.ConcatenateAxis(ws, 0, s); err != nil {
+			return nil, fmt.Errorf("merge linears: concat weights: %w", err)
+		}
+		if out.qScales, err = b.ConcatenateAxis(scales, 0, s); err != nil {
+			out.Free()
+			return nil, fmt.Errorf("merge linears: concat scales: %w", err)
+		}
+		if out.qBiases, err = b.ConcatenateAxis(biases, 0, s); err != nil {
+			out.Free()
+			return nil, fmt.Errorf("merge linears: concat biases: %w", err)
+		}
+		out.qGroupSize, out.qBits, out.qMode = first.qGroupSize, first.qBits, first.qMode
+	case full == len(parts):
+		// Full-precision weights are stored pre-transposed [in, out], so the
+		// parts concatenate along the output axis 1.
+		ws := make([]tensor.Array, len(parts))
+		for i, p := range parts {
+			ws[i] = p.wT
+		}
+		var err error
+		if out.wT, err = b.ConcatenateAxis(ws, 1, s); err != nil {
+			return nil, fmt.Errorf("merge linears: concat weights: %w", err)
+		}
+	default:
+		return nil, fmt.Errorf("merge linears: projections have no weights")
+	}
+
+	// Optional bias: all or none.
+	withBias := 0
+	for _, p := range parts {
+		if p.bias != nil {
+			withBias++
+		}
+	}
+	if withBias != 0 {
+		if withBias != len(parts) {
+			out.Free()
+			return nil, fmt.Errorf("merge linears: bias on only some projections")
+		}
+		bs := make([]tensor.Array, len(parts))
+		for i, p := range parts {
+			bs[i] = p.bias
+		}
+		var err error
+		if out.bias, err = b.ConcatenateAxis(bs, 0, s); err != nil {
+			out.Free()
+			return nil, fmt.Errorf("merge linears: concat bias: %w", err)
+		}
+	}
+
+	// Materialize once at load time rather than on the first decode step.
+	for _, a := range []tensor.Array{out.qW, out.qScales, out.qBiases, out.wT, out.bias} {
+		if a == nil {
+			continue
+		}
+		if err := a.Eval(); err != nil {
+			out.Free()
+			return nil, fmt.Errorf("merge linears: eval: %w", err)
+		}
+	}
+	return out, nil
+}
+
 // NewLinearFull creates a full-precision linear from a pre-transposed weight.
 func NewLinearFull(wT tensor.Array) *Linear { return &Linear{wT: wT} }
 

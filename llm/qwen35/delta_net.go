@@ -27,6 +27,15 @@ import (
 //	out = out_proj(rms_norm_gated(y, z))
 type gatedDeltaNet struct {
 	// Projections (shared llm.Linear: full-precision or quantized).
+	//
+	// inProj is the four input projections merged into one wide matmul
+	// (qkv, z, b, a — in that order). All four read the same x, so one wide
+	// kernel replaces four narrow ones at decode shape; measured worth ~3%
+	// decode throughput, bit-identical output. inProjQKV/inProjZ/inProjB/
+	// inProjA stay nil when the merge succeeds and remain the fallback when
+	// it cannot (mixed quantization across the four, or differing quant
+	// parameters).
+	inProj    *llm.Linear  // [hidden, convDim + valueDim + 2*numV]
 	inProjQKV *llm.Linear  // [hidden, key_dim*2 + value_dim]
 	inProjZ   *llm.Linear  // [hidden, value_dim]
 	inProjB   *llm.Linear  // [hidden, Hv]
@@ -66,11 +75,11 @@ func newGatedDeltaNet(cfg llm.ModelConfig) *gatedDeltaNet {
 
 // free releases all arrays owned by the block.
 func (g *gatedDeltaNet) free() {
-	g.inProjQKV.Free()
-	g.inProjZ.Free()
-	g.inProjB.Free()
-	g.inProjA.Free()
-	g.outProj.Free()
+	for _, l := range []*llm.Linear{g.inProj, g.inProjQKV, g.inProjZ, g.inProjB, g.inProjA, g.outProj} {
+		if l != nil {
+			l.Free()
+		}
+	}
 	g.conv1d.Free()
 	g.norm.Free()
 	g.ALog.Free()
@@ -109,6 +118,17 @@ func (g *gatedDeltaNet) loadWeights(sf *llm.SafetensorsFile, name string, b tens
 	}
 	if g.outProj, err = load(name + ".out_proj.weight"); err != nil {
 		return fmt.Errorf("out_proj: %w", err)
+	}
+
+	// Merge the four input projections into one wide matmul. They all read
+	// the same x, so one kernel replaces four at decode shape. MergeLinears
+	// declines (leaving the four in place) when they cannot share a kernel.
+	if merged, mErr := llm.MergeLinears(b, s, g.inProjQKV, g.inProjZ, g.inProjB, g.inProjA); mErr == nil {
+		g.inProj = merged
+		for _, l := range []*llm.Linear{g.inProjQKV, g.inProjZ, g.inProjB, g.inProjA} {
+			l.Free()
+		}
+		g.inProjQKV, g.inProjZ, g.inProjB, g.inProjA = nil, nil, nil, nil
 	}
 
 	// conv1d.weight: [conv_dim, kernel, 1] (sanitized MLX layout, depthwise).
@@ -159,6 +179,81 @@ func (g *gatedDeltaNet) loadWeights(sf *llm.SafetensorsFile, name string, b tens
 	return nil
 }
 
+// inProjections runs the four input projections that all read the same x:
+// qkv, z, b and a, in that order. When the block was loaded with a merged
+// inProj this is one wide matmul plus constant-bounded slices; otherwise it
+// is four separate projections. The caller owns the returned arrays.
+//
+// Constant-bounded Slices, NOT SplitAxis: the compiled decode trace runs on
+// shape-undefined placeholders, and Split infers output shapes from the
+// input's axis length, which is undefined there.
+func (g *gatedDeltaNet) inProjections(x tensor.Array, b tensor.Backend, s tensor.Stream) (qkv, z, bOut, a tensor.Array, err error) {
+	if g.inProj == nil {
+		if qkv, err = g.inProjQKV.Forward(x, b, s); err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("in_proj_qkv: %w", err)
+		}
+		if z, err = g.inProjZ.Forward(x, b, s); err != nil {
+			qkv.Free()
+			return nil, nil, nil, nil, fmt.Errorf("in_proj_z: %w", err)
+		}
+		if bOut, err = g.inProjB.Forward(x, b, s); err != nil {
+			qkv.Free()
+			z.Free()
+			return nil, nil, nil, nil, fmt.Errorf("in_proj_b: %w", err)
+		}
+		if a, err = g.inProjA.Forward(x, b, s); err != nil {
+			qkv.Free()
+			z.Free()
+			bOut.Free()
+			return nil, nil, nil, nil, fmt.Errorf("in_proj_a: %w", err)
+		}
+		return qkv, z, bOut, a, nil
+	}
+
+	all, err := g.inProj.Forward(x, b, s)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("in_proj: %w", err)
+	}
+	defer all.Free()
+
+	shape := all.Shape()
+	slice := func(from, to int) (tensor.Array, error) {
+		// Leading axes keep their full extent: start 0, stop shape[i].
+		start := make([]int, len(shape))
+		stop := make([]int, len(shape))
+		copy(stop, shape)
+		start[len(shape)-1] = from
+		stop[len(shape)-1] = to
+		strides := make([]int, len(shape))
+		for i := range strides {
+			strides[i] = 1
+		}
+		return b.Slice(all, start, stop, strides, s)
+	}
+	zFrom := g.convDim
+	bFrom := zFrom + g.valueDim
+	aFrom := bFrom + g.numV
+	if qkv, err = slice(0, zFrom); err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("in_proj slice qkv: %w", err)
+	}
+	if z, err = slice(zFrom, bFrom); err != nil {
+		qkv.Free()
+		return nil, nil, nil, nil, fmt.Errorf("in_proj slice z: %w", err)
+	}
+	if bOut, err = slice(bFrom, aFrom); err != nil {
+		qkv.Free()
+		z.Free()
+		return nil, nil, nil, nil, fmt.Errorf("in_proj slice b: %w", err)
+	}
+	if a, err = slice(aFrom, aFrom+g.numV); err != nil {
+		qkv.Free()
+		z.Free()
+		bOut.Free()
+		return nil, nil, nil, nil, fmt.Errorf("in_proj slice a: %w", err)
+	}
+	return qkv, z, bOut, a, nil
+}
+
 // forward runs the DeltaNet block over a sequence of hidden states.
 // cache holds the fixed-size recurrent state (State [B,Hv,Dv,Dk] and
 // ConvState [B, convK-1, convDim]); it is populated on prefill and updated
@@ -171,28 +266,14 @@ func (g *gatedDeltaNet) forward(x tensor.Array, cache *llm.KVCache, layerIdx, se
 		return nil, fmt.Errorf("delta_net: bad input shape %v", x.Shape())
 	}
 
-	qkv, err := g.inProjQKV.Forward(x, b, s)
+	// The four input projections, merged into one matmul when possible.
+	qkv, z, bOut, a, err := g.inProjections(x, b, s)
 	if err != nil {
-		return nil, fmt.Errorf("in_proj_qkv: %w", err)
+		return nil, err
 	}
 	defer qkv.Free()
-
-	z, err := g.inProjZ.Forward(x, b, s)
-	if err != nil {
-		return nil, fmt.Errorf("in_proj_z: %w", err)
-	}
 	defer z.Free()
-
-	bOut, err := g.inProjB.Forward(x, b, s)
-	if err != nil {
-		return nil, fmt.Errorf("in_proj_b: %w", err)
-	}
 	defer bOut.Free()
-
-	a, err := g.inProjA.Forward(x, b, s)
-	if err != nil {
-		return nil, fmt.Errorf("in_proj_a: %w", err)
-	}
 	defer a.Free()
 
 	// Convolution: concat cached conv rows with qkv, run depthwise silu-conv.
