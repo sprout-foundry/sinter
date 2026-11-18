@@ -43,6 +43,14 @@ type sparseMoeBlock struct {
 	// switchGateProj/switchUpProj then stay in place.
 	switchInProj *llm.Linear
 	interSize    int
+
+	// sharedInProj is the shared expert's gate_proj, up_proj and
+	// shared_expert_gate merged into one matvec: all three read the same x
+	// and each produces disjoint output rows. Two fewer launches per layer,
+	// 40 layers deep. nil when the merge was declined (mixed quantization,
+	// or a LoRA adapter covering only some of them).
+	sharedInProj    *llm.Linear
+	sharedInterSize int
 }
 
 func (m *sparseMoeBlock) loadWeights(sf *llm.SafetensorsFile, prefix string, b tensor.Backend, s tensor.Stream, quant *llm.QuantConfig, lora *llm.LoraAdapter, mergedClasses map[string]bool) error {
@@ -105,6 +113,22 @@ func (m *sparseMoeBlock) loadWeights(sf *llm.SafetensorsFile, prefix string, b t
 		m.switchUpProj.Free()
 		m.switchGateProj, m.switchUpProj = nil, nil
 	}
+
+	// Merge the shared expert's gate, up and expert-gate projections the same
+	// way. All three read x and write disjoint output rows, so one matvec
+	// replaces three. Declines (leaving them separate) on mixed quantization.
+	if m.sharedGateProj.IsQuantized() {
+		m.sharedInterSize = m.sharedGateProj.QW().Shape()[0]
+	} else {
+		m.sharedInterSize = m.sharedGateProj.WT().Shape()[1]
+	}
+	if merged, mErr := llm.MergeLinears(b, s, m.sharedGateProj, m.sharedUpProj, m.sharedExpertGate); mErr == nil {
+		m.sharedInProj = merged
+		m.sharedGateProj.Free()
+		m.sharedUpProj.Free()
+		m.sharedExpertGate.Free()
+		m.sharedGateProj, m.sharedUpProj, m.sharedExpertGate = nil, nil, nil
+	}
 	return nil
 }
 
@@ -127,6 +151,9 @@ func (m *sparseMoeBlock) free() {
 	if m.switchDownProj != nil {
 		m.switchDownProj.Free()
 	}
+	if m.sharedInProj != nil {
+		m.sharedInProj.Free()
+	}
 	if m.sharedGateProj != nil {
 		m.sharedGateProj.Free()
 	}
@@ -144,16 +171,59 @@ func (m *sparseMoeBlock) free() {
 // sharedExpertForward runs the always-on shared expert branch:
 // sigmoid(shared_expert_gate(x)) * shared_expert(x).
 func (m *sparseMoeBlock) sharedExpertForward(xFlat tensor.Array, b tensor.Backend, s tensor.Stream) (tensor.Array, error) {
-	sharedGate, err := m.sharedGateProj.Forward(xFlat, b, s)
-	if err != nil {
-		return nil, fmt.Errorf("moe shared gate: %w", err)
+	var sharedGate, sharedUp, sharedGateLogit tensor.Array
+	if m.sharedInProj != nil {
+		// Merged: gate | up | expert-gate in one matvec, split back out.
+		all, err := m.sharedInProj.Forward(xFlat, b, s)
+		if err != nil {
+			return nil, fmt.Errorf("moe shared in_proj: %w", err)
+		}
+		defer all.Free()
+		shape := all.Shape()
+		inter := m.sharedInterSize
+		slice := func(from, to int) (tensor.Array, error) {
+			start := make([]int, len(shape))
+			stop := make([]int, len(shape))
+			copy(stop, shape)
+			start[len(shape)-1] = from
+			stop[len(shape)-1] = to
+			strides := make([]int, len(shape))
+			for i := range strides {
+				strides[i] = 1
+			}
+			return b.Slice(all, start, stop, strides, s)
+		}
+		if sharedGate, err = slice(0, inter); err != nil {
+			return nil, fmt.Errorf("moe shared split gate: %w", err)
+		}
+		defer sharedGate.Free()
+		if sharedUp, err = slice(inter, 2*inter); err != nil {
+			return nil, fmt.Errorf("moe shared split up: %w", err)
+		}
+		defer sharedUp.Free()
+		if sharedGateLogit, err = slice(2*inter, 2*inter+1); err != nil {
+			return nil, fmt.Errorf("moe shared split gate_logit: %w", err)
+		}
+		defer sharedGateLogit.Free()
+	} else {
+		var err error
+		sharedGate, err = m.sharedGateProj.Forward(xFlat, b, s)
+		if err != nil {
+			return nil, fmt.Errorf("moe shared gate: %w", err)
+		}
+		defer sharedGate.Free()
+		sharedUp, err = m.sharedUpProj.Forward(xFlat, b, s)
+		if err != nil {
+			return nil, fmt.Errorf("moe shared up: %w", err)
+		}
+		defer sharedUp.Free()
+		sharedGateLogit, err = m.sharedExpertGate.Forward(xFlat, b, s)
+		if err != nil {
+			return nil, fmt.Errorf("moe shared_expert_gate: %w", err)
+		}
+		defer sharedGateLogit.Free()
 	}
-	defer sharedGate.Free()
-	sharedUp, err := m.sharedUpProj.Forward(xFlat, b, s)
-	if err != nil {
-		return nil, fmt.Errorf("moe shared up: %w", err)
-	}
-	defer sharedUp.Free()
+
 	sharedAct, err := llm.SwiGLU(sharedUp, sharedGate, b, s)
 	if err != nil {
 		return nil, fmt.Errorf("moe shared swiglu: %w", err)
@@ -165,11 +235,6 @@ func (m *sparseMoeBlock) sharedExpertForward(xFlat tensor.Array, b tensor.Backen
 	}
 	defer sharedOut.Free()
 
-	sharedGateLogit, err := m.sharedExpertGate.Forward(xFlat, b, s)
-	if err != nil {
-		return nil, fmt.Errorf("moe shared_expert_gate: %w", err)
-	}
-	defer sharedGateLogit.Free()
 	sharedGateSigmoid, err := b.Sigmoid(sharedGateLogit, s)
 	if err != nil {
 		return nil, fmt.Errorf("moe shared sigmoid: %w", err)
@@ -254,6 +319,7 @@ func (m *sparseMoeBlock) router(xFlat tensor.Array, b tensor.Backend, s tensor.S
 //  5. y = switch_mlp(x, inds) * scores      [B, S, hidden]
 //  6. shared_y = sigmoid(shared_expert_gate(x)) * shared_expert(x)
 //  7. y = y + shared_y
+//
 // moeVariant reports which internal op group the scratch SINTER_MOE_VARIANT
 // diagnostic switches off. Each variant keeps the block's output shape so the
 // surrounding chain traces unchanged; numerics change, so these are

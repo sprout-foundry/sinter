@@ -110,6 +110,16 @@ weighting and the sum over the expert axis changes nothing (292 vs 299µs), so
 the residual is run-to-run variance and non-additivity rather than a real op
 group.
 
+**The shared expert's three input projections are now one matvec.** Its
+`gate_proj`, `up_proj` and `shared_expert_gate` all read the same x and write
+disjoint output rows, so `MergeLinears` folds them into a single launch — two
+fewer per layer, 40 layers deep. Bit-identical (same token ids), and worth
++0.5% at short context and +3.8% at 2541 tokens (interleaved, 3 pairs:
+short 62.4/62.8/62.3 vs 61.8/62.5/62.2, long 50.1/51.6/50.5 vs
+50.3/48.1/48.2). The long-context gain is the larger one because the saved
+launches are a fixed cost per layer, so they weigh more against a smaller
+per-token budget.
+
 **Block-level ablations do not decompose — do not bisect inside a block.**
 The full-attention block measures 5.3ms, but every part of it measures near
 zero: merging q/k/v into one matvec is +0.4%, ablating `o_proj` is -0.3%
