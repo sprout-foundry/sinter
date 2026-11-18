@@ -1,6 +1,6 @@
 # sinter — handoff
 
-Last updated: 2026-11-18 08:57
+Last updated: 2026-11-18 09:12
 
 Vision input works end to end on MLX and GGML, and the bugs that were
 blocking it are fixed and released. This document is the forward plan:
@@ -206,10 +206,12 @@ already said. Candidate #1 is dead; only kernel speed is left.
 
 Method, since the trace tooling was not obvious: `.gputrace` bundles are
 Xcode's format and are not parseable (Apple's private "MTSP" container, and
-21GB because they dump every buffer). `xctrace record --template 'Metal
-System Trace'` produces a 158MB `.trace` whose tables `xctrace export`
-writes as XML, and a Go test that writes wall-clock markers around the
-decode lets the window be cut exactly. See Verified commands.
+21GB because they dump every buffer). Opening one for the 35B made Xcode try
+to address 355GB on a 64GB machine, so that route is a dead end at this
+model size. `xctrace record --template 'Metal System Trace'` produces a
+158MB `.trace` whose tables `xctrace export` writes as XML, and a Go test
+that writes wall-clock markers around the decode lets the window be cut
+exactly. See Verified commands.
 
 **Target.** >100 tok/s on the 35B. Summing the measured parts gives ~11.5ms
 of real work, i.e. a ~87 tok/s ceiling with the current kernels. The floor
@@ -452,9 +454,13 @@ SINTER_BACKEND=metal go test -count=1 -run TestSpikeApply65Inputs -v ./mlx/
 # Metal capture of steady-state decode, for per-kernel GPU times in
 # Instruments. MTL_CAPTURE_ENABLED=1 is REQUIRED — without it the Metal debug
 # layer is absent and start_capture fails with "Capture layer is not
-# inserted". The bundle is large (21GB for the 35B, because it dumps every
-# buffer) and only Xcode can open it, not Instruments; it is Apple's private
-# format and not parseable. Prefer the xctrace route below.
+# inserted".
+#
+# This route is effectively unusable for a large model. The bundle is 21GB for
+# the 35B (it dumps every buffer), only Xcode can open it (not Instruments),
+# it is Apple's private format and not parseable — and opening it made Xcode
+# try to address 355GB of memory on a 64GB machine, so it had to be killed.
+# Use the xctrace route below instead.
 mkdir -p /tmp/sprout/capture
 MTL_CAPTURE_ENABLED=1 SINTER_BACKEND=metal \
 SINTER_MTP_PARITY_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \
