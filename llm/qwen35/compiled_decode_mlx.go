@@ -151,9 +151,11 @@ func (q *Qwen35) PrepareCompiledDecode(promptLen, maxTokens int, cache *llm.KVCa
 	if err != nil {
 		return fail(err)
 	}
+	traceStart := time.Now()
 	plain, err := mlx.NewClosure(func(in []*mlx.Array) ([]*mlx.Array, error) {
 		return q.compiledDecodeBody(cd, in)
 	})
+	traceEl := time.Since(traceStart)
 	if err != nil {
 		for _, a := range inputs {
 			a.Free()
@@ -183,7 +185,9 @@ func (q *Qwen35) PrepareCompiledDecode(promptLen, maxTokens int, cache *llm.KVCa
 	if err := mlx.SetCompileMode(mode); err != nil {
 		return fail(fmt.Errorf("qwen35: compiled decode: set compile mode: %w", err))
 	}
+	compileStart := time.Now()
 	compiled, err := plain.Compile(false) // fixed shapes by design
+	compileEl := time.Since(compileStart)
 	if err != nil {
 		plain.Free()
 		for _, a := range inputs {
@@ -213,7 +217,19 @@ func (q *Qwen35) PrepareCompiledDecode(promptLen, maxTokens int, cache *llm.KVCa
 		dummies = append(dummies, z)
 	}
 	traceInputs := append([]*mlx.Array{inputs[0], inputs[1]}, dummies...)
+	applyStart := time.Now()
 	outs, err := compiled.Apply(traceInputs)
+	applyEl := time.Since(applyStart)
+	if debugCompiledDecode() {
+		// Per-turn setup cost, paid on every Generate: the trace walks the
+		// whole decode body in Go, Compile builds the replay plan, and the
+		// first apply runs it once. Measured on qwen3.6-35b-a3b-4bit:
+		// trace and compile are both under a millisecond, so the first apply
+		// (~40ms) is the whole per-turn cost — caching the compiled closure
+		// across turns would save that and nothing more.
+		log.Printf("qwen35: compiled decode setup: trace=%v compile=%v first apply=%v (capacity=%d)",
+			traceEl.Round(time.Microsecond), compileEl.Round(time.Microsecond), applyEl.Round(time.Microsecond), cd.capacity)
+	}
 	for _, z := range dummies {
 		z.Free()
 	}

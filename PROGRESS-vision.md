@@ -1,6 +1,6 @@
 # sinter — handoff
 
-Last updated: 2026-11-17 22:05
+Last updated: 2026-11-18 05:40
 
 Vision input works end to end on MLX and GGML, and the bugs that were
 blocking it are fixed and released. This document is the forward plan:
@@ -66,7 +66,8 @@ commits its own command buffer — do not trust them for absolute cost.
 
 **Where the ~16ms/token actually goes** (35B, short context, compiled):
 
-- weight reads ~1669MB/token (1383MB across 40 layers + 286MB `lm_head`)
+- weight reads ~1590MB/token (505MB DeltaNet projections, 660MB MoE, 136MB
+  full attention, 286MB `lm_head`)
 - MoE (40 layers): 3.1ms for 660MB — 213 GB/s, already dense-equivalent, so
   the expert dispatch is NOT the problem. The router chain is inside the noise
 - linear attention (30 layers): ~4.5ms, of which ~2.9ms is the projections
@@ -74,8 +75,44 @@ commits its own command buffer — do not trust them for absolute cost.
 - vocabulary head: 2.0ms (286MB, 143 GB/s); argmax over 248k vocab: 0.5ms
 - full attention (10 layers): ~1ms
 - elementwise norms and residual adds: ~0.4ms under compile (2.2ms eager)
-- compiled-closure staging: ~1.5ms (30 recurrent states, 2MB fp32 each,
-  crossing the closure boundary in and out every step)
+
+**Closure staging is not a cost — that line was wrong.** The earlier estimate
+of ~1.5ms for staging 30 recurrent states in and out does not survive
+measurement. `Closure.Apply` passes array handles, not data: a 65-input apply
+dispatches in **73µs** (`TestSpikeApply65Inputs`), and the whole per-token
+apply is 1ms of CPU against 12ms of GPU, so it is entirely hidden. The
+recurrent state's 120MB/token of read+write is real, but it is the kernel's
+own traffic, counted below, not a boundary copy.
+
+**Nothing here is bandwidth-bound.** Against each block's own floor at
+400 GB/s, every one runs 2-5x slow:
+
+| block | bytes/token | floor | measured | effective |
+|---|---|---|---|---|
+| DeltaNet projections (30) | 505MB | 1.26ms | 2.9ms | 174 GB/s |
+| MoE (40) | 660MB | 1.65ms | 3.1ms | 213 GB/s |
+| full attention (10) | 136MB | 0.34ms | 1.0ms | 136 GB/s |
+| vocabulary head | 286MB | 0.72ms | 2.0ms | 143 GB/s |
+| DeltaNet recurrent state (30) | 120MB | 0.30ms | 1.6ms | **75 GB/s** |
+
+The recurrent kernel is the worst and the simplest: it loads a 2MB fp32
+state, does one step of ~8 flops per element, and stores it back — a
+memcpy-shaped kernel at 75 GB/s. It is fp32 because the checkpoint declares
+`mamba_ssm_dtype: float32`, so halving it to bf16 is a numerics change, not
+a free win.
+
+Every block being uniformly 2-5x off its floor is the signature of a
+latency/occupancy problem, not a bytes problem — which is exactly what a
+Metal capture would resolve, and why no host-side restructuring has moved
+the number.
+
+**Per-turn setup is ~40ms, and it is not worth caching.** The compiled
+closure is traced and compiled on every `Generate` and released on return,
+which looked like an easy win. Measured: the Go-side trace and `Compile`
+are both under a millisecond, and the first apply is ~40ms. Caching the
+closure across turns would save that 40ms and nothing more, so it is not
+worth the shape-keying it would need. `SINTER_LOCAL_DEBUG=1` now prints
+the breakdown.
 
 **The 35B is not bandwidth-starved — it is per-layer-overhead-bound.** Per
 layer, on the same machine, compiled decode costs:
@@ -110,11 +147,14 @@ at high iteration counts: the recurrent kernel measured 0.238ms/layer at 10
 chained iterations, 0.145 at 50, and 0.084 at 200. Always report the iteration
 count, and prefer full-model A/B ablations over isolated timings.
 
-**Target.** >100 tok/s on the 35B. Summing the parts gives ~11.5ms of real
-work, i.e. a ~87 tok/s ceiling with the current kernels, and the per-layer
-table above says the remaining distance is per-layer overhead rather than
-bytes. Reaching 100 needs a GPU profile to find what that ~400µs is, not
-another scheduling change.
+**Target.** >100 tok/s on the 35B. Summing the measured parts gives ~11.5ms
+of real work, i.e. a ~87 tok/s ceiling with the current kernels. The floor
+table above says where that ceiling comes from: not bytes, since every block
+already runs 2-5x off its own bandwidth floor, but latency. Reaching 100
+means making the GPU saturate memory — a profile (Metal capture, read in
+Instruments) to find what stalls each block, not another scheduling change.
+The recurrent kernel is the cheapest place to start: it is the furthest from
+its floor (75 GB/s) and the simplest kernel in the graph.
 
 **Consumer follow-up.** sprout's `pkg/localmodel/local_provider_chat.go` sets
 `PromptLookupMaxDrafts = 6` in two places, so production still takes the
@@ -222,6 +262,13 @@ Qwen3.5-2B-4bit, same machine: prefill ~1736 tok/s, decode ~141 tok/s
   suggests. Fewer kernels is not the lever.
 - **Sampling path** — greedy/no-penalty vs the defaults is identical, so CPU
   argmax over the 248k vocab is not the cost (argmax itself is 0.5ms).
+- **Closure staging** — a 65-input `Closure.Apply` dispatches in 73µs
+  (`TestSpikeApply65Inputs`), and the per-token apply is 1ms of CPU against
+  12ms of GPU, so it is fully hidden. Handles are passed, not data. There is
+  no 1.5ms boundary copy to reclaim.
+- **Caching the compiled closure across turns** — it is traced and compiled
+  on every `Generate`, but both are under a millisecond; the ~40ms first
+  apply is the only per-turn cost. Not worth shape-keying.
 - **MTP** — none of the three checkpoints (`Qwen3.5-2B-4bit`,
   `qwen3.5-4b-bf16`, `qwen3.6-35b-a3b-4bit`) ships MTP tensors.
 
@@ -313,6 +360,9 @@ SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b
 SINTER_CACHE_DIR=/tmp/sprout/prefix-ab SINTER_BACKEND=metal \
 SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \
   go test -count=1 -run TestScratchColdStart -v ./llm/qwen35/
+
+# Closure-boundary cost for 65 inputs (prints dispatch vs dispatch+eval)
+SINTER_BACKEND=metal go test -count=1 -run TestSpikeApply65Inputs -v ./mlx/
 
 # Image cap end to end over HTTP (scratch)
 SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/Qwen3.5-2B-4bit \
