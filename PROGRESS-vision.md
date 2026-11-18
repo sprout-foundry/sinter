@@ -347,29 +347,44 @@ model size. `xctrace record --template 'Metal System Trace'` produces a
 that writes wall-clock markers around the decode lets the window be cut
 exactly. See Verified commands.
 
-**Target.** >100 tok/s on the 35B. The ablation puts the whole step at
-15.4ms, so the ceiling with today's kernels is ~65 tok/s — the components
-already sum to the total, and there is no unaccounted slack to reclaim.
-Getting to 100 means making two blocks faster, in this order:
+**Target.** The old ">100 tok/s" figure is not supported by anything measured,
+and the "~65 tok/s ceiling with today's kernels" claim it rested on is
+**wrong**: mlx-lm reaches 76.0 tok/s on this model with the same MLX kernels
+and no compilation, so the ceiling is at least 76. sinter is at 63. The
+honest target is to close that 18% gap first; anything beyond 76 needs a
+kernel that does not exist yet, and nothing here justifies predicting it.
 
-1. **Full attention — 2.66ms of real GPU work per token (266µs/block, 51
-   GB/s), plus ~2.6ms of critical-path latency.** The isolated block is 8x
-   off its 400 GB/s floor. Bisecting it needs env-gated variants of the block
-   measured as 100-iteration chains (`TestScratchAttnChain`); per-op timing
-   and in-model sub-ablations both fail here, for the reasons above.
-2. **MoE — 7.6ms in-model; ~140-155µs/block isolated, of which the two
+Two blocks dominate the step, in this order:
+
+1. **MoE — 7.6ms in-model; ~140-155µs/block isolated, of which the two
    routed-expert gathers are ~52%.** The largest single op group in the model
    (~5.6ms/token isolated across 40 layers), reading 12.6MB at 90 GB/s. The
    `gather_qmm` slot sweep says the call is fixed-cost dominated (k=1 and k=8
    cost the same), so the lever is per-call overhead, not bytes — and that
    overhead is inside MLX, not reachable from Go. `sorted_indices` is the one
-   documented hint still untested; it needs an argsort binding.
+   documented hint still untested; it needs an argsort binding. Note mlx-lm
+   uses *two* `gather_qmm` calls here where sinter merges to one, so this
+   block is not where sinter loses to mlx-lm.
+2. **Full attention — 2.66ms of real GPU work per token (266µs/block, 51
+   GB/s), plus ~2.6ms of critical-path latency.** The isolated block is 8x
+   off its 400 GB/s floor. Two measured differences from mlx-lm: the additive
+   mask mlx-lm avoids by keeping its cache exact-length (0.64ms/token), and
+   the full-capacity `Where` scatter (~0.29ms). Bisecting further needs
+   env-gated variants of the block measured as 100-iteration chains
+   (`TestScratchAttnChain`); per-op timing and in-model sub-ablations both
+   fail here, for the reasons above.
 
-Both need per-kernel GPU counters to separate occupancy from access pattern.
-The Metal System Trace has the Shader Timeline disabled and xctrace exposes
-no option to enable it, so it gives coverage but not per-kernel attribution.
-Xcode's Metal debugger is the only route, and the 35B's `.gputrace` is not
-openable on a 64GB machine — use a smaller model there.
+The gap that is not yet attributed — roughly 12 of the 18 points — is most
+likely the pipelining difference: mlx-lm overlaps the next token's compute
+with CPU sampling via `mx.async_eval`, and sinter's `SINTER_PIPELINE_DECODE`
+measures exactly the eager number, so it is not overlapping at all. That is
+the next thing to chase, and it is contained: the scaffolding exists.
+
+Per-kernel GPU counters would settle the rest. The Metal System Trace has the
+Shader Timeline disabled and xctrace exposes no option to enable it, so it
+gives coverage but not per-kernel attribution. Xcode's Metal debugger is the
+only route, and the 35B's `.gputrace` is not openable on a 64GB machine — use
+a smaller model there.
 
 The capture path is verified working — see the command in Verified
 commands. It needs `MTL_CAPTURE_ENABLED=1`, which the earlier attempt was
