@@ -1,6 +1,6 @@
 # sinter — handoff
 
-Last updated: 2026-11-18 08:25
+Last updated: 2026-11-18 08:57
 
 Vision input works end to end on MLX and GGML, and the bugs that were
 blocking it are fixed and released. This document is the forward plan:
@@ -193,17 +193,36 @@ at high iteration counts: the recurrent kernel measured 0.238ms/layer at 10
 chained iterations, 0.145 at 50, and 0.084 at 200. Always report the iteration
 count, and prefer full-model A/B ablations over isolated timings.
 
+**Profiled: the GPU is 95% busy during decode, so stalls are not the
+problem.** The handoff had two candidates for the ~400µs per layer: kernel
+serialization inside a layer, and the MoE gather being internally
+serialized. A Metal System Trace of a marked decode window (64 tokens,
+0.986s = 15.4ms/token) settles the first: **GPU busy 0.938s of 0.986s =
+95.1% coverage**, 23 gaps totalling 47ms, mean 2.0ms, max 20.3ms. There is
+no idle time to reclaim — even eliminating every gap would buy 5%.
+
+So the time is inside the kernels, which is what the floor table above
+already said. Candidate #1 is dead; only kernel speed is left.
+
+Method, since the trace tooling was not obvious: `.gputrace` bundles are
+Xcode's format and are not parseable (Apple's private "MTSP" container, and
+21GB because they dump every buffer). `xctrace record --template 'Metal
+System Trace'` produces a 158MB `.trace` whose tables `xctrace export`
+writes as XML, and a Go test that writes wall-clock markers around the
+decode lets the window be cut exactly. See Verified commands.
+
 **Target.** >100 tok/s on the 35B. Summing the measured parts gives ~11.5ms
 of real work, i.e. a ~87 tok/s ceiling with the current kernels. The floor
 table above says where that ceiling comes from: the large-tensor blocks all
 run 2-5x off their own bandwidth floor. Small-op count is not a factor
-(measured above), so the remaining work is making those kernels saturate
-memory. The two furthest from their floor are the DeltaNet recurrent kernel
-(75 GB/s — a memcpy-shaped kernel over a 2MB fp32 state) and the vocabulary
-head (143 GB/s). Both need a Metal capture read in Instruments to show
-whether the stall is occupancy, dependency serialization or a bad access
-pattern; the ablations available from Go are now exhausted, and each one
-tried has come back negative.
+(measured above) and neither is dependency serialization (profiled above),
+so the remaining work is making those kernels saturate memory. The two
+furthest from their floor are the DeltaNet recurrent kernel (75 GB/s — a
+memcpy-shaped kernel over a 2MB fp32 state) and the vocabulary head
+(143 GB/s). What is left to determine is occupancy versus access pattern,
+which needs per-kernel GPU counters rather than the timeline: the Metal
+System Trace used above has the Shader Timeline disabled, so it gives
+coverage but not per-kernel attribution.
 
 The capture path is verified working — see the command in Verified
 commands. It needs `MTL_CAPTURE_ENABLED=1`, which the earlier attempt was
@@ -434,13 +453,28 @@ SINTER_BACKEND=metal go test -count=1 -run TestSpikeApply65Inputs -v ./mlx/
 # Instruments. MTL_CAPTURE_ENABLED=1 is REQUIRED — without it the Metal debug
 # layer is absent and start_capture fails with "Capture layer is not
 # inserted". The bundle is large (21GB for the 35B, because it dumps every
-# buffer); capture with Instruments' reduced-data option if space matters.
+# buffer) and only Xcode can open it, not Instruments; it is Apple's private
+# format and not parseable. Prefer the xctrace route below.
 mkdir -p /tmp/sprout/capture
 MTL_CAPTURE_ENABLED=1 SINTER_BACKEND=metal \
 SINTER_MTP_PARITY_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \
 SINTER_CAPTURE_DIR=/tmp/sprout/capture \
   go test -count=1 -run TestScratchMetalCapture -v ./llm/
-# then: open /tmp/sprout/capture/compiled.gputrace in Instruments
+
+# GPU timeline as parseable XML, which is how the 95% decode coverage above
+# was measured. TestScratchTracePhases writes wall-clock markers around one
+# decode to /tmp/sprout/phases.txt so the window can be cut exactly.
+cd /Users/alanp/dev/sprout-foundry/sinter && go test -c -o /tmp/sprout/qwen35.test ./llm/qwen35/
+SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \
+  xcrun xctrace record --template 'Metal System Trace' --output /tmp/sprout/ph.trace \
+  --launch -- /tmp/sprout/qwen35.test -test.run TestScratchTracePhases -test.v
+xcrun xctrace export --input /tmp/sprout/ph.trace --toc   # gives start-date + table list
+xcrun xctrace export --input /tmp/sprout/ph.trace \
+  --xpath '/trace-toc/run[@number="1"]/data/table[@schema="metal-gpu-intervals"]' \
+  --output /tmp/sprout/ph_gpu.xml
+# Then: filter rows to gpu-channel-name=Compute and metal-nesting-level=0,
+# resolve the XML's id/ref deduplication, merge overlapping intervals, and
+# compare merged busy time against the window span.
 
 # Image cap end to end over HTTP (scratch)
 SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/Qwen3.5-2B-4bit \
