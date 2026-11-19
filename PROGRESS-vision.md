@@ -27,55 +27,63 @@ MoE gate/up, shared-expert inputs), and the cross-restart prefix store (see
 "Just shipped" below), which takes a cold first turn on the 35B from 8.7s to
 0.4s.
 
-## Engine comparison — mlx-lm is 18-22% faster on identical weights
-
-Measured on the same machine, same model directories, greedy decoding:
+## Engine comparison — llama.cpp is the only verified cross-engine number
 
 | engine | 4B | 35B-A3B | notes |
 |---|---|---|---|
-| **mlx-lm** (Python) | **98.8** | **76.0** | no `mx.compile` at all; `mx.async_eval` pipelining |
 | sinter (compiled) | ~81 | ~63 | current default |
 | sinter (eager) | — | 56.1 | `SINTER_COMPILED_DECODE=0` |
-| llama.cpp (Q4_K_M) | 67.4 | n/a | `llama-bench`, 4B GGUF |
+| llama.cpp (Q4_K_M) | 62.2 ± 0.8 | n/a | `llama-bench -p 0 -n 64 -r 3`, 4B GGUF |
 
-The gap is consistent across both models, so it is systemic, not one block.
-Two things follow from it.
+llama.cpp is ~23% slower than sinter on the 4B. Its quant is Q4_K_M rather
+than MLX 4-bit, so treat it as an order-of-magnitude check, not a
+like-for-like one. It is not the tool to chase.
 
-**mlx-lm does not compile.** Its `generate_step` calls the model eagerly and
-pipelines with `mx.async_eval` — compute the next token while the CPU samples
-the current one. So sinter's compiled path (63) is 17% behind an *uncompiled*
-reference (76), which means compilation is not where the remaining headroom
-is, and sinter's own `SINTER_PIPELINE_DECODE=1` is not equivalent: it measures
-56.1, exactly the eager number, so it is not overlapping anything.
+**mlx-lm throughput numbers are withdrawn — it cannot run on this machine.**
+An earlier revision of this document recorded mlx-lm at 98.8 tok/s (4B) and
+76.0 (35B) and built an "18-22% gap" analysis on them. Those numbers are
+**not reproducible and should not be treated as a target**: `import mlx_lm`
+fails on every Python here with `ModuleNotFoundError: No module named
+'mlx.utils'`, the installed `mlx` (Homebrew 0.32.3, unchanged since Oct 9)
+ships no `mlx.utils`, and no script or venv that produced them exists. If the
+comparison is wanted, fix the mlx install first and measure it under one
+harness against sinter.
 
-**What mlx-lm does differently in the hot path.** Its `KVCache` mutates the
-buffer in place (`self.keys[..., prev:offset, :] = keys`) and returns a slice
-of exactly `offset` positions, so at decode it passes **no attention mask**.
-sinter over-allocates the buffer to a fixed capacity for compilation and must
-pass an additive array mask in every full-attention layer. Dropping the mask
-in the chain harness is worth 64µs/block (309 -> 245µs, 0.64ms/token), and
-the full-capacity `Where` scatter adds ~0.29ms — together ~6% of the step,
-real but not the whole 18%.
+What survives from that investigation is the **source reading**, which does
+not depend on mlx-lm being runnable:
 
-Its MoE and DeltaNet are otherwise *less* optimized than sinter's: mlx-lm
-issues four separate DeltaNet input projections where sinter merges them into
-one, and two `gather_qmm` calls where sinter merges gate/up into one. So the
-remaining gap is not in those blocks' structure.
+- **mlx-lm does not compile.** `mx.compile` appears only in
+  `sample_utils.py` (the sampling functions), never around the model forward.
+  Its loop is eager plus `mx.async_eval` pipelining.
+- **Its loop is the same algorithm as sinter's `usePipelined`.** Both build
+  the next step chained onto the current token array, `async_eval` it, then
+  read back the current one. So sinter's pipelined path measuring the eager
+  number is not a bug — see "Pipelining is ruled out" below.
+- **Its `KVCache` mutates in place and returns an exact-length slice**
+  (`self.keys[..., prev:offset, :] = keys`), so at decode it passes **no
+  attention mask**. sinter's compiled path over-allocates to a fixed capacity
+  and must pass an additive array mask in every full-attention layer. Dropping
+  the mask in the chain harness is worth 64µs/block (309 -> 245µs,
+  0.64ms/token), and the full-capacity `Where` scatter adds ~0.29ms.
+- **Its MoE and DeltaNet are less optimized than sinter's**: four separate
+  DeltaNet input projections where sinter merges them into one, and two
+  `gather_qmm` calls where sinter merges gate/up into one.
 
-**Dead end for this comparison.** llama.cpp is slower than both on the 4B
-(67.4 vs 81 vs 98.8), so it is not the tool to chase. Note its quant is
-Q4_K_M rather than MLX 4-bit, so treat it as an order-of-magnitude check, not
-a like-for-like one.
+So the mask and scatter are real, measured differences worth ~6% of the step
+— but with the mlx-lm baseline withdrawn, there is no verified evidence that
+sinter is behind anything on this hardware. The honest position is that
+sinter's compiled path is the fastest decode measured here.
+
 
 ## Do this next, in order
 
-### 1. Close the remaining decode gap — it is not launch overhead
+### 1. Decode efficiency — the cost model is measured, the ceiling is not
 
-**Status: the diagnosis is done; the fix is not.** Compiled decode used to be
-dead code: `useCompiled` requires `!usePipelined`, and pipelined decode was
-default-ON, so `SINTER_COMPILED_DECODE=0` changed nothing (which is exactly
-what the earlier 47.3 vs 47.2 tok/s measured). Pipelined is now opt-in, so
-compiled runs by default and wins:
+**Status: the cost model is measured; the ceiling is not.** Compiled decode
+used to be dead code: `useCompiled` requires `!usePipelined`, and pipelined
+decode was default-ON, so `SINTER_COMPILED_DECODE=0` changed nothing (which
+is exactly what the earlier 47.3 vs 47.2 tok/s measured). Pipelined is now
+opt-in, so compiled runs by default and wins:
 
 | model | eager | compiled | gain |
 |---|---|---|---|
@@ -350,12 +358,14 @@ model size. `xctrace record --template 'Metal System Trace'` produces a
 that writes wall-clock markers around the decode lets the window be cut
 exactly. See Verified commands.
 
-**Target.** The old ">100 tok/s" figure is not supported by anything measured,
-and the "~65 tok/s ceiling with today's kernels" claim it rested on is
-**wrong**: mlx-lm reaches 76.0 tok/s on this model with the same MLX kernels
-and no compilation, so the ceiling is at least 76. sinter is at 63. The
-honest target is to close that 18% gap first; anything beyond 76 needs a
-kernel that does not exist yet, and nothing here justifies predicting it.
+**Target.** There is no verified external reference to aim at. The old
+">100 tok/s" figure was never supported by a measurement, and the
+"~65 tok/s ceiling with today's kernels" claim that replaced it rested on the
+mlx-lm numbers that are now withdrawn (see "Engine comparison" above).
+sinter's compiled path at ~63 tok/s on the 35B is the fastest decode measured
+on this hardware. What is defensible is a floor, not a ceiling: the step is
+15.9ms and the weight reads alone are ~4.2ms at the machine's 400 GB/s, so
+there is real headroom, but nothing here quantifies how much.
 
 Two blocks dominate the step, in this order:
 
@@ -377,7 +387,7 @@ Two blocks dominate the step, in this order:
    (`TestScratchAttnChain`); per-op timing and in-model sub-ablations both
    fail here, for the reasons above.
 
-**Pipelining is ruled out as the explanation.** mlx-lm's `generate_step` and
+**Pipelining is not a lever here.** mlx-lm's `generate_step` and
 sinter's `usePipelined` loop are the *same algorithm*: build the next step
 chained onto the current token array, `async_eval` it, then read back the
 current one — so the read-back of step i overlaps the dispatch of step i+1.
@@ -387,8 +397,7 @@ the eager number is therefore not a bug to fix: with a 95%-busy GPU and a
 hard data dependency between consecutive tokens, there is almost nothing to
 overlap. Do not spend more time here.
 
-**Compiled decode pays 2.4ms of design costs that mlx-lm does not.**
-63 tok/s is 15.9ms/token; mlx-lm's 76 is 13.2ms. The difference:
+**What compiled decode costs, and what it buys.** Measured per token:
 
 | cost | per token | why sinter pays it |
 |---|---|---|
@@ -396,45 +405,23 @@ overlap. Do not spend more time here.
 | additive SDPA mask | 0.64ms | the K/V buffer is capacity-sized, so attention needs a mask |
 | in-graph `Where` scatter | 0.29ms | the new K/V row is written by a full-capacity select |
 
-All three are consequences of one decision: compiled decode needs static
-shapes, so the cache cannot be exactly `pos+1` long and cannot be mutated in
-place. mlx-lm avoids all three by never compiling — it slices its cache to
-`offset` and writes the new row host-side. That covers 2.4ms of the 2.7ms
-gap, but it is not the whole story, because the eager path avoids all three
-too and is slower still.
+All three follow from needing static shapes. The eager path avoids all of
+them — `AppendWindow` returns a slice to `used` and `forward.go` passes no
+array mask — and still measures 56 tok/s against compiled's 63. So compiling
+the elementwise chain is worth more than the 2.4ms these three cost (2.2ms
+eager vs 0.4ms compiled for norms and residual adds alone). Compiled decode
+is therefore the right default, and these three are its price, not a bug to
+remove.
 
-So closing the gap is not an optimization, it is a choice between two
-designs. But note what the eager numbers say, because they cut against the
-obvious conclusion: sinter's **eager** path already uses an exact-length
-window (`AppendWindow` returns a slice to `used`, and `forward.go` passes no
-array mask), so it pays none of the three costs above — and it measures 56
-tok/s, *slower* than compiled's 63. The compiled path pays 2.4ms of design
-costs and still wins by 1.9ms, because compiling the elementwise chain saves
-more than that (2.2ms eager vs 0.4ms compiled).
+**The remaining headroom is not identified.** With the mlx-lm baseline
+withdrawn there is no verified reference to close a gap to. The step is
+15.9ms and the weight reads alone are ~4.2ms at 400 GB/s, so headroom exists,
+but nothing measured says how much or where. If a reference is wanted, the
+first step is to fix the `mlx` install (`mlx.utils` is missing, so `mlx_lm`
+cannot import) and measure it under one harness against sinter — same
+prompt, same token count, same greedy settings — rather than comparing two
+harnesses' self-reported numbers.
 
-That leaves a real open question, and it is **not** the cache design. sinter's
-eager path builds one lazy graph per step, flushes the cache updates in a
-single batched `AsyncEvalBatch`, and evals once at the end — the same
-structure as mlx-lm's `_step` + `async_eval`. So the 4.6ms between sinter's
-eager (17.8ms/token) and mlx-lm's eager (13.2ms) is not eval discipline
-either; that hypothesis is ruled out by inspection (`forward.go`, the
-`ForwardDecode` layer loop). It is unattributed, and it is the one number
-worth chasing: if sinter's eager reached mlx-lm's eager, compiled decode
-would be redundant on this model.
-
-Two things to check when the machine is quiet enough to measure (load average
-must be under ~10; it sat between 56 and 103 during this work, which is why
-none of this is resolved):
-
-1. Re-measure mlx-lm and sinter back-to-back on the same prompt, same token
-   count, same greedy settings, so the 18-22% is confirmed under one harness
-   rather than across two. mlx-lm's own reported tok/s and sinter's
-   decode-only harness may not be defined the same way, and that alone could
-   account for part of the difference.
-2. If the gap survives (1), count command buffers per step on each. Same
-   graph, same eval count, different time means the difference is inside the
-   ops — most likely how the quantized matvec is dispatched, not how the
-   step is scheduled.
 
 Per-kernel GPU counters would settle the rest. The Metal System Trace has the
 Shader Timeline disabled and xctrace exposes no option to enable it, so it
@@ -544,13 +531,13 @@ Qwen3.5-2B-4bit, same machine: prefill ~1736 tok/s, decode ~141 tok/s
 - **Delta kernel threadgroup count** — `SetThreadGroup(32, 4/8/16, 1)`, i.e.
   1024/512/256 threadgroups, measured 54.7/54.6/53.8 tok/s interleaved at
   2541 tokens. The kernel is not threadgroup-scheduling-bound.
-- **Pipelined decode as the explanation for the mlx-lm gap** — sinter's loop
-  is the same algorithm as mlx-lm's `generate_step` (build next chained on the
-  current token, `async_eval`, then read back the current). It measures the
-  eager number because with a 95%-busy GPU and a hard token-to-token data
+- **Pipelined decode as a source of headroom** — sinter's loop is the same
+  algorithm as mlx-lm's `generate_step` (build next chained on the current
+  token, `async_eval`, then read back the current). It measures the eager
+  number because with a 95%-busy GPU and a hard token-to-token data
   dependency there is nothing to overlap. Also slower than compiled on all
   three models (35B 52.6/53.0, 2B 112.3/116.3, 4B 75.3/75.3). Opt-in via
-  `SINTER_PIPELINE_DECODE=1`; do not re-chase it as a gap.
+  `SINTER_PIPELINE_DECODE=1`; do not re-chase it.
 - **Prompt-lookup** — slower than compiled even on verbatim-echo prompts
   (35B 51.6-53.8 at k=4 and k=6, 2B 106-114). Instrumented: 362 of 414 decode
   steps found no n-gram candidate, so the search and verify batches cost more
