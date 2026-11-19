@@ -39,36 +39,40 @@ llama.cpp is ~23% slower than sinter on the 4B. Its quant is Q4_K_M rather
 than MLX 4-bit, so treat it as an order-of-magnitude check, not a
 like-for-like one. It is not the tool to chase.
 
-### mlx-lm is the reference, and sinter is 15-32% behind it
+### mlx-lm is the reference
 
-Measured on a quiet machine (load 1.7-2.6) with **token-exact prompts**: the
-same token ids sinter used are fed to mlx-lm, so both engines decode the same
-sequence and the same amount of work. Decode is first-generated-token to
-last, excluding prefill, on both sides. mlx-lm is a venv at
+Measured with token-exact decode on both engines (decode is
+first-generated-token to last, excluding prefill). mlx-lm is a venv at
 `/tmp/sprout/mlxenv` (python3.12, mlx 0.32.4, mlx-lm); the Homebrew `mlx`
 0.32.3 install is broken (`mlx.utils` missing) and must not be used.
+`bench/mlx_vs_sinter.py` is the harness.
 
 | model | prompt | mlx-lm | sinter | gap |
 |---|---|---|---|---|
-| qwen3.5-4b-4bit | short (~63 tok) | 98.2 | 81.4 | **−17%** |
-| qwen3.5-4b-4bit | long (~2500 tok) | 98.2 | 69.5 | **−29%** |
-| qwen3.6-35b-a3b-4bit | short (~63 tok) | 73.4 | 62.6 | **−15%** |
-| qwen3.6-35b-a3b-4bit | long (~2500 tok) | 74.9 | 51.2 | **−32%** |
+| Qwen3.5-2B-4bit | short (15 tok) | 185.6 | 158.6 | **−14.5%** |
+| Qwen3.5-2B-4bit | long (2541 tok) | 177.5 | 141.6 | **−20.2%** |
 
-Two things follow, and they are the most useful facts in this document:
+Two corrections to earlier revisions of this table, both measurement errors
+on the mlx-lm side, now fixed:
 
-1. **The gap is real** — 15-17% at short context, and it reproduces across
-   both models within a point or two. An earlier revision of this document
-   recorded 98.8/76.0 from a run that could not be reproduced; the numbers
-   above are the reproducible ones and happen to be close, but they are
-   measured, not asserted.
-2. **The gap widens sharply with context** — 17% → 29% on the 4B and 15% →
-   32% on the 35B, going from a ~63-token prompt to a ~2500-token one (the
-   same short prompt behind a repeated system prefix). mlx-lm is flat across
-   both (98.2/98.2 and 73.4/74.9) while sinter loses 12-19%.
-   **Something in sinter's decode scales with sequence length that does not
-   scale in mlx-lm.** That is the target, and it is a different target from
-   every per-step-overhead hypothesis chased so far.
+1. **The "long" mlx-lm runs were not long.** `mlxlm_tokenexact.py` fed
+   mlx-lm the *generated* ids (62-63 tokens), so the old "long" rows
+   measured a short prompt and made mlx-lm look flat across context. With
+   real 2541-token prompts, mlx-lm loses **4.4%** (185.6 → 177.5) — close
+   to the ~0.2 ms/token that 2500 real K/V positions inherently cost (the
+   2B reads ~31 MB/token of K/V at that length; ~0.08 ms at 400 GB/s, plus
+   FLOPs). mlx-lm pays physics; sinter loses ~15%, so about 10 points of
+   sinter's loss is engine-specific and the rest is inherent.
+2. **The short-context gap is the bigger absolute term** and it is
+   context-independent: 27 tok/s on the 2B at 15 tokens (185.6 vs 158.6),
+   present at every length. This is per-step overhead (dispatch, staging,
+   sampling tail), not attention. The context-dependent extra is smaller:
+   sinter loses 10.7% long-vs-short where mlx-lm loses 4.4%, so ~6 points
+   (~0.4 ms/token at 2541 tokens) is engine-specific context cost on top of
+   physics.
+
+The old 4B/35B rows (98.2/81.4 short, 73.4/62.6) were measured with the
+flawed harness on the mlx-lm side; re-measure before quoting them.
 
 **The capacity-sized buffer is ruled out as the *whole* cause, not as a
 cost.** The obvious candidate was compiled decode's over-allocated K/V
@@ -189,12 +193,13 @@ model still costs the same number of steps — `TestScratchAblate` cannot price
 | DeltaNet (24 layers) | 0.80 ms (7%) | 0.88 ms (7%) | +0.08 |
 | **whole step** | **11.94** | **13.19** | **+1.25** |
 
-Attention accounts for **107%** of the growth (the MoE slightly shrinks,
-inside noise) and the other two are flat. That is the whole context-dependent
-gap: sinter loses ~1.25ms/token going to a 2500-token prompt and attention is
-all of it. The per-token growth is far larger than the ~1ms the earlier
-estimate gave attention, and it is the term to attack — mlx-lm is flat over
-the same range, so it is not paying this.
+Attention accounts for **107% of the growth** as measured here (the MoE
+slightly shrinks, inside noise) and the other two are flat. Note this table
+predates the matched-capacity correction: short and long ran at different
+natural capacities (256 vs 2816), so part of what it attributes to "growth"
+is capacity difference. The corrected split is in the matched-capacity runs
+below: full attention is ~two-thirds of the context growth, and most of
+attention's cost is the buffer size, not the tokens in it.
 
 **Inside attention, the mask and the scatter are not the growth either.**
 Priced with toggles in the real block (`TestScratchAttnSubops`, 2B, fixed 64
@@ -227,12 +232,16 @@ the only candidates left in the block.
   are what made attention look like 107% of the growth: short and long were
   paying different capacities.
 
-So the fix shape is: full attention must run over `used` positions, not
-`capacity` — which is exactly what mlx-lm does (its cache is sliced to
-`offset`, so SDPA sees the real sequence and needs no mask). Sinter's
-compiled path reads and attends over the whole capacity buffer every layer,
-every token; at 8192 capacity that is 6 layers × 32MB of K/V read to attend
-to a few hundred real positions.
+So the fix shape is: full attention over `used` positions instead of
+`capacity` — which is what mlx-lm does (its cache is sliced to `offset`, so
+SDPA sees the real sequence and needs no mask). But note the ceiling this
+buy: in the natural case capacity is already tight (2816 for a 2541+64
+generation, ~8% padding), so slicing saves only that padding plus whatever
+the additive mask itself costs SDPA (~0.4 ms/token measured by
+`SINTER_ATTN_NOMASK`). The bigger, context-independent gap (14.5% at 15
+tokens) is per-step overhead outside attention entirely; the matched-capacity
+data above says attention is 1.04 ms of a 6.9 ms step and only 0.22 of that
+grows with context.
 
 The MoE block is dominated by the two routed-expert gathers. Chained the
 same way (`TestScratchMoeChain`, `SINTER_MOE_VARIANT` for the sub-groups),
@@ -533,11 +542,23 @@ eager vs 0.4ms compiled for norms and residual adds alone). Compiled decode
 is therefore the right default, and these three are its price, not a bug to
 remove.
 
-**The headroom, now identified.** The mlx-lm comparison above is the verified
-reference: 15-17% at short context and 29-32% at ~60 tokens, on both models.
-The step is 15.9ms and the weight reads alone are ~4.2ms at 400 GB/s, so
-there is room; the context-dependent part of the gap is the part worth
-chasing, because it is the part that grows.
+**The headroom, corrected.** The paired mlx-lm measurement (2B, identical
+prompts, best of 3) splits the gap two ways:
+
+- **14.5% at 15-token context** — context-independent per-step overhead.
+  mlx-lm's step is 5.4ms, sinter's 6.3ms, at zero context effect. This is
+  the bigger term and lives in dispatch/staging/sampling tail, not
+  attention (which is 1.04ms of the 6.9ms step at this size).
+- **~6 points extra context loss** (10.7% vs mlx-lm's 4.4% at 2541 tokens,
+  ~0.4 ms/token) — the engine-specific part. The matched-capacity and
+  sub-op toggles bound the candidates: the additive mask SDPA cost
+  (~0.4 ms/token via `SINTER_ATTN_NOMASK`), capacity padding (~8% in the
+  natural case), and residual sequence-length effects.
+
+The context-dependent term is real but smaller than earlier revisions
+claimed (the old "mlx-lm is flat" was a harness bug — see the Engine
+comparison). The constant 14.5% is the larger prize and is the same
+per-layer-overhead problem the cost model already describes.
 
 
 Per-kernel GPU counters would settle the rest. The Metal System Trace has the

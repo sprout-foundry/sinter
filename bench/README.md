@@ -5,15 +5,19 @@ Reference-engine benchmarks compared against sinter's own decode harness
 
 ## mlx-lm
 
-`mlxlm_tokenexact.py` is the comparison that matters. It feeds mlx-lm the
-exact token ids sinter reported for the same prompts, so both engines decode
-the same sequence and do the same amount of work. Decode time runs from the
-first generated token to the last, excluding prefill, on both sides.
+`mlx_vs_sinter.py` is the comparison that matters. It encodes the SAME
+prompts through mlx-lm's own tokenizer (15 and 2541 tokens), runs best of 3,
+and measures decode first-token-to-last. Pair it with sinter's
+`TestScratchMlxPaired` (llm/qwen35/zz_ablate_test.go, gitignored), which
+uses the identical prompts and accounting.
 
-`mlxlm_bench.py` is the earlier string-prompt version. It is kept only to
-show why token-exact matters: mlx-lm's chat template emits ` thinking` where
-sinter's does not, so the two generate different content and the comparison
-is confounded.
+`mlxlm_tokenexact.py` is kept only as a warning: it fed mlx-lm the token ids
+sinter *generated* (62-63 tokens), so its "long" rows measured a short
+prompt and made mlx-lm look flat across context. That false flatness
+mis-attributed sinter's context cost for a whole session. Do not use it.
+
+`mlxlm_bench.py` is the earliest string-prompt version. It is confounded
+differently (mlx-lm's template emits ` thinking` where sinter's does not).
 
 ### Setup
 
@@ -28,8 +32,11 @@ python3.12 -m venv /tmp/sprout/mlxenv
 ### Run
 
 ```bash
-/tmp/sprout/mlxenv/bin/python bench/mlxlm_tokenexact.py \
-  /Users/alanp/dev/llm-models/qwen3.5-4b-4bit 3
+/tmp/sprout/mlxenv/bin/python bench/mlx_vs_sinter.py \
+  /Users/alanp/dev/llm-models/Qwen3.5-2B-4bit
+
+SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/Qwen3.5-2B-4bit \
+  go test -count=1 -run TestScratchMlxPaired -v ./llm/qwen35/
 ```
 
 Benchmark on a quiet machine. `sysctl -n vm.loadavg` above ~10 makes the
@@ -38,5 +45,7 @@ than the effects being measured.
 
 ### Results
 
-See "mlx-lm is the reference" in `PROGRESS-vision.md` for the current table
-and what it implies.
+Corrected paired numbers (2B, load ~5-12): mlx-lm 185.6 short / 177.5 long
+(−4.4% with context); sinter 158.6 / 141.6 (−10.7%). Gap: −14.5% short,
+−20.2% long. See "mlx-lm is the reference" in `PROGRESS-vision.md` for what
+this implies — the constant short-context term is the larger one.
