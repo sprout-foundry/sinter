@@ -39,18 +39,57 @@ llama.cpp is ~23% slower than sinter on the 4B. Its quant is Q4_K_M rather
 than MLX 4-bit, so treat it as an order-of-magnitude check, not a
 like-for-like one. It is not the tool to chase.
 
-**mlx-lm throughput numbers are withdrawn — it cannot run on this machine.**
-An earlier revision of this document recorded mlx-lm at 98.8 tok/s (4B) and
-76.0 (35B) and built an "18-22% gap" analysis on them. Those numbers are
-**not reproducible and should not be treated as a target**: `import mlx_lm`
-fails on every Python here with `ModuleNotFoundError: No module named
-'mlx.utils'`, the installed `mlx` (Homebrew 0.32.3, unchanged since Oct 9)
-ships no `mlx.utils`, and no script or venv that produced them exists. If the
-comparison is wanted, fix the mlx install first and measure it under one
-harness against sinter.
+### mlx-lm is the reference, and sinter is 15-32% behind it
 
-What survives from that investigation is the **source reading**, which does
-not depend on mlx-lm being runnable:
+Measured on a quiet machine (load 1.7-2.6) with **token-exact prompts**: the
+same token ids sinter used are fed to mlx-lm, so both engines decode the same
+sequence and the same amount of work. Decode is first-generated-token to
+last, excluding prefill, on both sides. mlx-lm is a venv at
+`/tmp/sprout/mlxenv` (python3.12, mlx 0.32.4, mlx-lm); the Homebrew `mlx`
+0.32.3 install is broken (`mlx.utils` missing) and must not be used.
+
+| model | prompt | mlx-lm | sinter | gap |
+|---|---|---|---|---|
+| qwen3.5-4b-4bit | short (~63 tok) | 98.2 | 81.4 | **−17%** |
+| qwen3.5-4b-4bit | long (~2500 tok) | 98.2 | 69.5 | **−29%** |
+| qwen3.6-35b-a3b-4bit | short (~63 tok) | 73.4 | 62.6 | **−15%** |
+| qwen3.6-35b-a3b-4bit | long (~2500 tok) | 74.9 | 51.2 | **−32%** |
+
+Two things follow, and they are the most useful facts in this document:
+
+1. **The gap is real** — 15-17% at short context, and it reproduces across
+   both models within a point or two. An earlier revision of this document
+   recorded 98.8/76.0 from a run that could not be reproduced; the numbers
+   above are the reproducible ones and happen to be close, but they are
+   measured, not asserted.
+2. **The gap widens sharply with context** — 17% → 29% on the 4B and 15% →
+   32% on the 35B, going from a ~63-token prompt to a ~2500-token one (the
+   same short prompt behind a repeated system prefix). mlx-lm is flat across
+   both (98.2/98.2 and 73.4/74.9) while sinter loses 12-19%.
+   **Something in sinter's decode scales with sequence length that does not
+   scale in mlx-lm.** That is the target, and it is a different target from
+   every per-step-overhead hypothesis chased so far.
+
+**The capacity-sized buffer is ruled out as the cause.** The obvious
+candidate was compiled decode's over-allocated K/V buffer: attention runs
+over `capacity` positions rather than `used`, so the mask, the scatter and
+SDPA all grow with the buffer, and `kvGrowStep` is 256 — at a 63-token prompt
+the buffer is already 4x the sequence. Measured, it does not explain the
+gap: sinter's **eager** path uses an exact-length window and no array mask,
+and it degrades by the same ratio (76.4 → 68.0 tok/s, −11%, against compiled's
+81.2 → 69.3, −15%). Both paths lose ~1.5ms/token going from 63 to ~2500
+tokens, so the cost is in something both share — attention over a real
+sequence, the DeltaNet recurrence, or the MoE — not in the buffer design.
+mlx-lm loses nothing over the same range, so whatever it is, mlx-lm is not
+paying it.
+
+That narrows the target to a per-token cost that grows with sequence length
+and is common to both of sinter's decode paths. Nothing measured yet
+separates those three candidates; the ablation hooks (`SINTER_ABLATE=attn|
+moe|delta`, see zz_ablate_test.go) at both prompt lengths are the way to.
+
+What survives from the earlier investigation is the **source reading**, which
+does not depend on mlx-lm being runnable:
 
 - **mlx-lm does not compile.** `mx.compile` appears only in
   `sample_utils.py` (the sampling functions), never around the model forward.
@@ -413,14 +452,11 @@ eager vs 0.4ms compiled for norms and residual adds alone). Compiled decode
 is therefore the right default, and these three are its price, not a bug to
 remove.
 
-**The remaining headroom is not identified.** With the mlx-lm baseline
-withdrawn there is no verified reference to close a gap to. The step is
-15.9ms and the weight reads alone are ~4.2ms at 400 GB/s, so headroom exists,
-but nothing measured says how much or where. If a reference is wanted, the
-first step is to fix the `mlx` install (`mlx.utils` is missing, so `mlx_lm`
-cannot import) and measure it under one harness against sinter — same
-prompt, same token count, same greedy settings — rather than comparing two
-harnesses' self-reported numbers.
+**The headroom, now identified.** The mlx-lm comparison above is the verified
+reference: 15-17% at short context and 29-32% at ~60 tokens, on both models.
+The step is 15.9ms and the weight reads alone are ~4.2ms at 400 GB/s, so
+there is room; the context-dependent part of the gap is the part worth
+chasing, because it is the part that grows.
 
 
 Per-kernel GPU counters would settle the rest. The Metal System Trace has the
@@ -657,6 +693,13 @@ SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/Qwen3.5-2B-
 # Decode-path A/B (scratch, decode-only tok/s, short and long prompt)
 SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \
   go test -count=1 -run TestScratchDecodePaths -v ./llm/qwen35/
+
+# mlx-lm reference on the same token ids (token-exact, decode-only tok/s).
+# Needs a venv with mlx + mlx-lm; the Homebrew mlx install is broken (no
+# mlx.utils) and cannot import mlx_lm. See bench/README.md.
+python3.12 -m venv /tmp/sprout/mlxenv && /tmp/sprout/mlxenv/bin/pip install mlx mlx-lm
+/tmp/sprout/mlxenv/bin/python bench/mlxlm_tokenexact.py \
+  /Users/alanp/dev/llm-models/qwen3.5-4b-4bit 3
 
 # Component cost attribution (scratch, SINTER_ABLATE=attn|moe|delta)
 SINTER_BACKEND=metal SINTER_VISION_MODEL=/Users/alanp/dev/llm-models/qwen3.6-35b-a3b-4bit \
