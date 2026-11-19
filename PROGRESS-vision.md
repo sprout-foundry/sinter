@@ -195,6 +195,25 @@ all of it. The per-token growth is far larger than the ~1ms the earlier
 estimate gave attention, and it is the term to attack — mlx-lm is flat over
 the same range, so it is not paying this.
 
+**Inside attention, the mask and the scatter are not the growth either.**
+Priced with toggles in the real block (`TestScratchAttnSubops`, 2B, fixed 64
+steps, best of 3):
+
+| variant | short | long |
+|---|---|---|
+| `SINTER_ATTN_NOSCATTER` (skip the in-graph K/V write) | 0.39 | 0.38 |
+| `SINTER_ATTN_NOMASKCONSTRUCT` (reuse a constant mask) | 0.45 | 0.33 |
+| `SINTER_ATTN_NOMASK` (pass no mask to SDPA) | 0.47 | 0.46 |
+
+ms/token saved by removing each. Two things follow. First, **building the
+mask is nearly free** — `nomaskbuild` and `nomask` are within noise of each
+other (0.45 vs 0.47 short, 0.33 vs 0.46 long), so the ~0.47ms is what SDPA
+pays for *having* a mask, not for constructing one. That kills the mask
+hoisting idea for good: there is nothing to hoist. Second, **all three are
+flat across context**, so none of them is the term that grows. What remains
+is SDPA itself over a longer sequence and the four projections, and those are
+the only candidates left in the block.
+
 The MoE block is dominated by the two routed-expert gathers. Chained the
 same way (`TestScratchMoeChain`, `SINTER_MOE_VARIANT` for the sub-groups),
 the block is 270-300µs, and the variants separate it:

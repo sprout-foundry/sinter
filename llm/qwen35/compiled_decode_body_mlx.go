@@ -277,14 +277,24 @@ func (q *Qwen35) compiledFullAttentionLayer(h tensor.Array, lw *layerWeights, po
 		return nil, nil, fmt.Errorf("reshape eq: %w", err)
 	}
 	defer eq4.Free()
-	kUpd, err := b.Where(eq4, kRot, kBuf, s)
-	if err != nil {
-		return nil, nil, fmt.Errorf("k scatter: %w", err)
-	}
-	vUpd, err := b.Where(eq4, vT, vBuf, s)
-	if err != nil {
-		kUpd.Free()
-		return nil, nil, fmt.Errorf("v scatter: %w", err)
+	// SINTER_ATTN_NOSCATTER skips the in-graph write and passes the buffers
+	// through unchanged, which prices the scatter separately from the rest of
+	// the block. Numerically wrong (this token's key never lands), so
+	// timing-only.
+	var kUpd, vUpd tensor.Array
+	if os.Getenv("SINTER_ATTN_NOSCATTER") == "1" {
+		kUpd = b.RetainArray(kBuf)
+		vUpd = b.RetainArray(vBuf)
+	} else {
+		kUpd, err = b.Where(eq4, kRot, kBuf, s)
+		if err != nil {
+			return nil, nil, fmt.Errorf("k scatter: %w", err)
+		}
+		vUpd, err = b.Where(eq4, vT, vBuf, s)
+		if err != nil {
+			kUpd.Free()
+			return nil, nil, fmt.Errorf("v scatter: %w", err)
+		}
 	}
 
 	// Attention mask: positions <= pos valid (append-then-attend semantics:
@@ -292,55 +302,71 @@ func (q *Qwen35) compiledFullAttentionLayer(h tensor.Array, lw *layerWeights, po
 	// the fast-SDPA C++ path treats array masks as additive. Bitwise-
 	// identical to exact-length unmasked SDPA
 	// (TestSpikeSDPAPaddedBufferParity).
-	le, err := mlx.LessEqual(rg.(*mlx.Array), pos.(*mlx.Array), cd.streamM)
-	if err != nil {
-		kUpd.Free()
-		vUpd.Free()
-		return nil, nil, fmt.Errorf("less_equal: %w", err)
-	}
-	defer le.Free()
-	zero, err := b.NewArrayFromFloat32([]float32{0}, []int{1})
-	if err != nil {
-		kUpd.Free()
-		vUpd.Free()
-		return nil, nil, fmt.Errorf("zero: %w", err)
-	}
-	defer zero.Free()
-	negInf, err := b.NewArrayFromFloat32([]float32{float32(math.Inf(-1))}, []int{1})
-	if err != nil {
-		kUpd.Free()
-		vUpd.Free()
-		return nil, nil, fmt.Errorf("negInf: %w", err)
-	}
-	defer negInf.Free()
-	maskVals, err := b.Where(le, zero, negInf, s)
-	if err != nil {
-		kUpd.Free()
-		vUpd.Free()
-		return nil, nil, fmt.Errorf("where mask: %w", err)
-	}
-	defer maskVals.Free()
-	// Cast the mask to q's dtype (bf16 for quantized models): an fp32 mask
-	// would promote the scores to fp32 and round differently than the eager
-	// path's bf16 attention — enough to flip near-tie argmax tokens
-	// (matches ApplyCausalMask's own bf16 cast).
-	maskCast, err := b.AsType(maskVals, qRot.Dtype(), s)
-	if err != nil {
-		kUpd.Free()
-		vUpd.Free()
-		return nil, nil, fmt.Errorf("mask cast: %w", err)
-	}
-	defer maskCast.Free()
-	mask4, err := b.Reshape(maskCast, []int{1, 1, 1, kvCap}, s)
-	if err != nil {
-		kUpd.Free()
-		vUpd.Free()
-		return nil, nil, fmt.Errorf("reshape mask: %w", err)
-	}
-	defer mask4.Free()
-
+	//
+	// SINTER_ATTN_NOMASKCONSTRUCT skips building it and passes a constant
+	// zero mask instead, which prices the construction separately from what
+	// having a mask costs SDPA. Numerically wrong (the constant mask does not
+	// track pos), so timing-only.
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
-	var attnMask tensor.Array = mask4
+	var attnMask tensor.Array
+	if os.Getenv("SINTER_ATTN_NOMASKCONSTRUCT") == "1" {
+		constMask, err := b.Zeros([]int{1, 1, 1, kvCap}, qRot.Dtype(), s)
+		if err != nil {
+			kUpd.Free()
+			vUpd.Free()
+			return nil, nil, fmt.Errorf("constant mask: %w", err)
+		}
+		defer constMask.Free()
+		attnMask = constMask
+	} else {
+		le, err := mlx.LessEqual(rg.(*mlx.Array), pos.(*mlx.Array), cd.streamM)
+		if err != nil {
+			kUpd.Free()
+			vUpd.Free()
+			return nil, nil, fmt.Errorf("less_equal: %w", err)
+		}
+		defer le.Free()
+		zero, err := b.NewArrayFromFloat32([]float32{0}, []int{1})
+		if err != nil {
+			kUpd.Free()
+			vUpd.Free()
+			return nil, nil, fmt.Errorf("zero: %w", err)
+		}
+		defer zero.Free()
+		negInf, err := b.NewArrayFromFloat32([]float32{float32(math.Inf(-1))}, []int{1})
+		if err != nil {
+			kUpd.Free()
+			vUpd.Free()
+			return nil, nil, fmt.Errorf("negInf: %w", err)
+		}
+		defer negInf.Free()
+		maskVals, err := b.Where(le, zero, negInf, s)
+		if err != nil {
+			kUpd.Free()
+			vUpd.Free()
+			return nil, nil, fmt.Errorf("where mask: %w", err)
+		}
+		defer maskVals.Free()
+		// Cast the mask to q's dtype (bf16 for quantized models): an fp32
+		// mask would promote the scores to fp32 and round differently than
+		// the eager path's bf16 attention — enough to flip near-tie argmax
+		// tokens (matches ApplyCausalMask's own bf16 cast).
+		maskCast, err := b.AsType(maskVals, qRot.Dtype(), s)
+		if err != nil {
+			kUpd.Free()
+			vUpd.Free()
+			return nil, nil, fmt.Errorf("mask cast: %w", err)
+		}
+		defer maskCast.Free()
+		mask4, err := b.Reshape(maskCast, []int{1, 1, 1, kvCap}, s)
+		if err != nil {
+			kUpd.Free()
+			vUpd.Free()
+			return nil, nil, fmt.Errorf("reshape mask: %w", err)
+		}
+		defer mask4.Free()
+		attnMask = mask4
+	}
 	if os.Getenv("SINTER_ATTN_NOMASK") == "1" {
 		// Scratch ablation: drop the additive mask. Numerically wrong against
 		// a capacity-sized buffer (it attends to padding), but it isolates
