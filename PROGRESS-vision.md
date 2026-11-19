@@ -70,24 +70,25 @@ Two things follow, and they are the most useful facts in this document:
    scale in mlx-lm.** That is the target, and it is a different target from
    every per-step-overhead hypothesis chased so far.
 
-**The capacity-sized buffer is ruled out as the cause.** The obvious
-candidate was compiled decode's over-allocated K/V buffer: attention runs
-over `capacity` positions rather than `used`, so the mask, the scatter and
-SDPA all grow with the buffer, and `kvGrowStep` is 256 — at a 63-token prompt
-the buffer is already 4x the sequence. Measured, it does not explain the
-gap: sinter's **eager** path uses an exact-length window and no array mask,
-and it degrades by the same ratio (76.4 → 68.0 tok/s, −11%, against compiled's
-81.2 → 69.3, −15%). Both paths lose ~1.5ms/token going from 63 to ~2500
-tokens, so the cost is in something both share — attention over a real
-sequence, the DeltaNet recurrence, or the MoE — not in the buffer design.
-mlx-lm loses nothing over the same range, so whatever it is, mlx-lm is not
-paying it.
+**The capacity-sized buffer is ruled out as the *whole* cause, not as a
+cost.** The obvious candidate was compiled decode's over-allocated K/V
+buffer: attention runs over `capacity` positions rather than `used`, so the
+mask, the scatter and SDPA all grow with the buffer. sinter's **eager** path
+uses an exact-length window and no array mask, and it degrades by nearly the
+same ratio (76.4 → 68.0 tok/s, −11%, against compiled's 81.2 → 69.3, −15%),
+so the buffer alone cannot be the gap. But the matched-capacity measurements
+below show capacity IS a real, large cost inside attention — sinter pays it
+in the compiled path, and something else sequence-dependent remains in both
+paths. The two facts together: eager pays a ~2500-token cost with an
+exact-length buffer; compiled pays both that and the capacity cost.
 
 That narrowed the target to a per-token cost that grows with sequence length
 and is common to both of sinter's decode paths. **The ablation has now
 pinned it to full attention** — see "Attention is what makes the step grow
-with context" below. Attention accounts for 107% of the growth; the MoE and
-DeltaNet are flat.
+with context" below. (An earlier revision attributed 107% of the growth to
+attention; the matched-capacity runs below revise that — attention is about
+two-thirds of it, and most of attention's cost is the capacity-sized buffer
+itself, not the real tokens in it.)
 
 What survives from the earlier investigation is the **source reading**, which
 does not depend on mlx-lm being runnable:
@@ -213,6 +214,25 @@ hoisting idea for good: there is nothing to hoist. Second, **all three are
 flat across context**, so none of them is the term that grows. What remains
 is SDPA itself over a longer sequence and the four projections, and those are
 the only candidates left in the block.
+
+**Capacity, not tokens, is most of attention's cost** (`TestScratchAttnByTokens`,
+`TestScratchCapacitySweep2`, 2B, matched capacity, best of 3):
+
+- At FIXED capacity 2816, attention costs 3.06 ms/token with 15 real tokens
+  and 3.25 with 2541 — only +0.19 from the real tokens. The attn-ablated
+  control is flat (4.00 vs 3.99), so the split is clean.
+- At fixed 15 tokens, capacity 2816→8192 adds +0.77 ms/token (6.70→7.47
+  whole-step) — the capacity-sized K/V buffer, not the sequence, is the
+  dominant term. The natural-capacity runs (256 for short, 2816 for long)
+  are what made attention look like 107% of the growth: short and long were
+  paying different capacities.
+
+So the fix shape is: full attention must run over `used` positions, not
+`capacity` — which is exactly what mlx-lm does (its cache is sliced to
+`offset`, so SDPA sees the real sequence and needs no mask). Sinter's
+compiled path reads and attends over the whole capacity buffer every layer,
+every token; at 8192 capacity that is 6 layers × 32MB of K/V read to attend
+to a few hundred real positions.
 
 The MoE block is dominated by the two routed-expert gathers. Chained the
 same way (`TestScratchMoeChain`, `SINTER_MOE_VARIANT` for the sub-groups),
