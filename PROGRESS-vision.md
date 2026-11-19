@@ -232,16 +232,32 @@ the only candidates left in the block.
   are what made attention look like 107% of the growth: short and long were
   paying different capacities.
 
-So the fix shape is: full attention over `used` positions instead of
-`capacity` — which is what mlx-lm does (its cache is sliced to `offset`, so
-SDPA sees the real sequence and needs no mask). But note the ceiling this
-buy: in the natural case capacity is already tight (2816 for a 2541+64
-generation, ~8% padding), so slicing saves only that padding plus whatever
-the additive mask itself costs SDPA (~0.4 ms/token measured by
-`SINTER_ATTN_NOMASK`). The bigger, context-independent gap (14.5% at 15
-tokens) is per-step overhead outside attention entirely; the matched-capacity
-data above says attention is 1.04 ms of a 6.9 ms step and only 0.22 of that
-grows with context.
+So the fix shape was: full attention over `used` positions instead of
+`capacity` — which is what mlx-lm does. **Built and measured; it loses.**
+`SINTER_COMPILED_EXACT=1` implements the exact-length design (buffers carry
+only real positions, new row appended by concat, SDPA unmasked, closure
+compiled shapeless so growing lengths replay). Token ids are bit-identical
+to the capacity path on both prompts, so correctness is proven. But
+interleaved best-of-3 on the 2B (`TestScratchExactVsCapacity`):
+
+| prompt | capacity | exact | |
+|---|---|---|---|
+| short | 153.4 | 130.1 | **−15.2%** |
+| long | 138.8 | 126.8 | **−8.7%** |
+
+Exact mode removes ~0.85 ms/token of mask+scatter yet ends up +0.7-1.2
+ms/token slower, so concat-append costs ~1.5-2 ms/token more than the
+Where-scatter it replaces (fresh allocation + full-buffer copy per step per
+layer, plus shapeless replay giving up per-shape specialization). It does
+NOT collapse with length (flat ~128 tok/s from 850 to 2541 tokens,
+`TestScratchExactScaling`) — it is uniformly slower, not O(n²).
+
+Why mlx-lm wins with "the same" design: its cache is NOT concat. It writes
+in place into a pre-allocated buffer (`keys[..., prev:offset, :] = keys`)
+and passes a slice VIEW of exactly the used prefix — no copy, no capacity
+ops. That needs a dynamic-bound slice, which sinter's MLX binding does not
+expose (`Slice`/`SliceUpdate` take static Go ints). Reaching mlx-lm's design
+means adding a dynamic-slice C binding: a real project, not a tweak.
 
 The MoE block is dominated by the two routed-expert gathers. Chained the
 same way (`TestScratchMoeChain`, `SINTER_MOE_VARIANT` for the sub-groups),

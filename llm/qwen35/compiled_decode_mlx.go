@@ -81,6 +81,11 @@ type compiledDecode struct {
 	// capacity is the per-full-attention-layer sequence capacity. Shapes
 	// are constant for the whole generation — a change would recompile.
 	capacity int
+	// exact selects the exact-length K/V design (SINTER_COMPILED_EXACT=1):
+	// buffers carry only real positions, the new row is appended by concat,
+	// SDPA runs unmasked, and the closure is compiled shapeless so the
+	// growing lengths replay without recompiling.
+	exact bool
 	// kBufs/vBufs are the exact-length K/V buffers (owned); they grow by
 	// one row per step via the in-graph concat. Entries are nil for
 	// linear-attention layers.
@@ -107,11 +112,15 @@ func (q *Qwen35) PrepareCompiledDecode(promptLen, maxTokens int, cache *llm.KVCa
 		return fmt.Errorf("qwen35: compiled decode requires the MLX backend (got %q)", q.backend.Name())
 	}
 
+	exact := os.Getenv("SINTER_COMPILED_EXACT") == "1"
 	cd := &compiledDecode{
 		// Fixed-capacity K/V buffers (capacity rounded to compiledGrowStep):
 		// shapes are constant for the whole generation, so one compilation
 		// serves every step and every op traces with concrete shapes.
+		// (exact mode sizes buffers to the prompt with no rounding; see
+		// cd.exact.)
 		capacity:    compiledCapacity(promptLen + maxTokens),
+		exact:       exact,
 		kBufs:       make([]tensor.Array, q.cfg.NumLayers),
 		vBufs:       make([]tensor.Array, q.cfg.NumLayers),
 		deltaStates: make([]tensor.Array, q.cfg.NumLayers),
@@ -119,6 +128,12 @@ func (q *Qwen35) PrepareCompiledDecode(promptLen, maxTokens int, cache *llm.KVCa
 		backend:     q.backend,
 		stream:      q.stream,
 		streamM:     q.stream.(*mlx.Stream),
+	}
+	if exact {
+		// Exact-length buffers: promptLen positions now, one more per step.
+		// No capacity rounding — the whole point is to never attend over a
+		// position that is not real.
+		cd.capacity = promptLen + maxTokens
 	}
 	fail := func(err error) error {
 		q.freeCompiledState(cd)
@@ -136,7 +151,16 @@ func (q *Qwen35) PrepareCompiledDecode(promptLen, maxTokens int, cache *llm.KVCa
 		}
 		if layer.K != nil {
 			shape := layer.K.Shape()
-			padShape := []int{shape[0], shape[1], cd.capacity, shape[3]}
+			// In exact mode the buffers start at the prompt length (n real
+			// positions) and the body appends one per step. In capacity
+			// mode they are allocated at the rounded capacity and prefilled
+			// by copyPrefillWindow's scatter.
+			var padShape []int
+			if cd.exact {
+				padShape = []int{shape[0], shape[1], n, shape[3]}
+			} else {
+				padShape = []int{shape[0], shape[1], cd.capacity, shape[3]}
+			}
 			kb, err := q.backend.Zeros(padShape, layer.K.Dtype(), q.stream)
 			if err != nil {
 				return fail(fmt.Errorf("qwen35: compiled decode: alloc k buf: %w", err))
@@ -146,7 +170,15 @@ func (q *Qwen35) PrepareCompiledDecode(promptLen, maxTokens int, cache *llm.KVCa
 				kb.Free()
 				return fail(fmt.Errorf("qwen35: compiled decode: alloc v buf: %w", err))
 			}
-			if err := q.copyPrefillWindow(cd, i, kb, vb, layer.K, layer.V, n); err != nil {
+			if cd.exact {
+				// The prefill cache's window IS [.., n, ..] in exact mode, so
+				// the fresh zero buffers can be adopted directly after
+				// copying the window in; copyPrefillWindow handles both
+				// cases (its n-clamp is a no-op here).
+				if err := q.copyPrefillWindow(cd, i, kb, vb, layer.K, layer.V, n); err != nil {
+					return fail(err)
+				}
+			} else if err := q.copyPrefillWindow(cd, i, kb, vb, layer.K, layer.V, n); err != nil {
 				return fail(err)
 			}
 			// copyPrefillWindow adopts the zero-padded buffers (see its
@@ -202,7 +234,10 @@ func (q *Qwen35) PrepareCompiledDecode(promptLen, maxTokens int, cache *llm.KVCa
 		return fail(fmt.Errorf("qwen35: compiled decode: set compile mode: %w", err))
 	}
 	compileStart := time.Now()
-	compiled, err := plain.Compile(false) // fixed shapes by design
+	// exact mode compiles shapeless: the K/V buffer lengths grow by one
+	// every step (concat-append), so the compiled plan must accept changing
+	// shapes rather than being cached per exact shape.
+	compiled, err := plain.Compile(cd.exact)
 	compileEl := time.Since(compileStart)
 	if err != nil {
 		plain.Free()

@@ -162,6 +162,18 @@ func (q *Qwen35) compiledFullAttentionLayer(h tensor.Array, lw *layerWeights, po
 	seqLen := 1
 	kvCap := cd.capacity
 
+	// SINTER_COMPILED_EXACT switches this layer to exact-length K/V: the
+	// buffers carry only real positions and the new row is appended by
+	// concat. That removes the in-graph scatter AND the additive mask
+	// entirely (every position is real, so SDPA runs unmasked — the same
+	// design as mlx-lm's cache, and bitwise identical to the masked
+	// capacity path per TestSpikeSDPAPaddedBufferParity). The closure must
+	// then be compiled shapeless, because the buffer length grows every
+	// step; that is handled in PrepareCompiledDecode.
+	if cd.exact {
+		return q.compiledFullAttentionExact(h, lw, pos, stateIn, cd)
+	}
+
 	qFull, err := sa.qProj.Forward(h, b, s)
 	if err != nil {
 		return nil, nil, fmt.Errorf("q proj: %w", err)
@@ -384,6 +396,186 @@ func (q *Qwen35) compiledFullAttentionLayer(h tensor.Array, lw *layerWeights, po
 		attnMask = nil
 	}
 	ctx, err := b.FastScaledDotProductAttention(qRot, kUpd, vUpd, scale, "array", attnMask, nil, s)
+	if err != nil {
+		kUpd.Free()
+		vUpd.Free()
+		return nil, nil, fmt.Errorf("fused attention: %w", err)
+	}
+	defer ctx.Free()
+
+	ctxT, err := b.TransposeAxes(ctx, []int{0, 2, 1, 3}, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("ctx transpose: %w", err)
+	}
+	defer ctxT.Free()
+
+	ctxFlat, err := b.Reshape(ctxT, []int{1, seqLen, outDim}, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("ctx reshape: %w", err)
+	}
+	defer ctxFlat.Free()
+
+	gateSig, err := b.Sigmoid(qGate, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("gate sigmoid: %w", err)
+	}
+	defer gateSig.Free()
+
+	gated, err := b.Multiply(ctxFlat, gateSig, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("gate multiply: %w", err)
+	}
+	defer gated.Free()
+
+	out, err := sa.oProj.Forward(gated, b, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("o proj: %w", err)
+	}
+	return out, []*mlx.Array{kUpd.(*mlx.Array), vUpd.(*mlx.Array)}, nil
+}
+
+// compiledFullAttentionExact is the exact-length K/V variant of
+// compiledFullAttentionLayer: the buffers hold only real positions, the new
+// row is appended with Concat, and SDPA runs with no mask at all. This is
+// what removes the scatter (~0.38 ms/token) and the additive mask (~0.47
+// ms/token) — the two capacity-buffer costs the ablations priced.
+//
+// Correctness rests on TestSpikeSDPAPaddedBufferParity's result: masked
+// SDPA over a capacity buffer is bitwise identical to unmasked SDPA over
+// the first pos+1 positions, so this path produces the same attention
+// output as the scatter+mask design.
+//
+// The returned state is the GROWN buffer (one position longer); the closure
+// is compiled shapeless so the changing length replays without recompiling.
+func (q *Qwen35) compiledFullAttentionExact(h tensor.Array, lw *layerWeights, pos tensor.Array, stateIn []*mlx.Array, cd *compiledDecode) (tensor.Array, []*mlx.Array, error) {
+	s := q.stream
+	b := q.backend
+	cfg := q.cfg
+	sa := lw.selfAttn
+
+	kBuf := tensor.Array(stateIn[0])
+	vBuf := tensor.Array(stateIn[1])
+
+	headDim := cfg.HeadDim
+	outDim := cfg.NumHeads * headDim
+	seqLen := 1
+
+	qFull, err := sa.qProj.Forward(h, b, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("q proj: %w", err)
+	}
+	defer qFull.Free()
+
+	qFull4, err := b.Reshape(qFull, []int{1, seqLen, cfg.NumHeads, 2 * headDim}, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("q reshape4: %w", err)
+	}
+	defer qFull4.Free()
+
+	q2d, err := b.Slice(qFull4, []int{0, 0, 0, 0}, []int{1, seqLen, cfg.NumHeads, headDim}, []int{1, 1, 1, 1}, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("q slice: %w", err)
+	}
+	defer q2d.Free()
+
+	gate4, err := b.Slice(qFull4, []int{0, 0, 0, headDim}, []int{1, seqLen, cfg.NumHeads, 2 * headDim}, []int{1, 1, 1, 1}, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("q gate slice: %w", err)
+	}
+	defer gate4.Free()
+	qGate, err := b.Reshape(gate4, []int{1, seqLen, outDim}, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("q gate flatten: %w", err)
+	}
+	defer qGate.Free()
+
+	k2d, err := sa.kProj.Forward(h, b, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("k proj: %w", err)
+	}
+	defer k2d.Free()
+
+	v2d, err := sa.vProj.Forward(h, b, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("v proj: %w", err)
+	}
+	defer v2d.Free()
+
+	qR, err := b.Reshape(q2d, []int{1, seqLen, cfg.NumHeads, headDim}, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("q reshape: %w", err)
+	}
+	defer qR.Free()
+
+	kR, err := b.Reshape(k2d, []int{1, seqLen, cfg.NumKVHeads, headDim}, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("k reshape: %w", err)
+	}
+	defer kR.Free()
+
+	vR, err := b.Reshape(v2d, []int{1, seqLen, cfg.NumKVHeads, headDim}, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("v reshape: %w", err)
+	}
+	defer vR.Free()
+
+	qNormed, err := q.rmsNormQwen35(qR, sa.qNorm)
+	if err != nil {
+		return nil, nil, fmt.Errorf("q norm: %w", err)
+	}
+	defer qNormed.Free()
+
+	kNormed, err := q.rmsNormQwen35(kR, sa.kNorm)
+	if err != nil {
+		return nil, nil, fmt.Errorf("k norm: %w", err)
+	}
+	defer kNormed.Free()
+
+	qT, err := b.TransposeAxes(qNormed, []int{0, 2, 1, 3}, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("q transpose: %w", err)
+	}
+	defer qT.Free()
+
+	kT, err := b.TransposeAxes(kNormed, []int{0, 2, 1, 3}, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("k transpose: %w", err)
+	}
+	defer kT.Free()
+
+	vT, err := b.TransposeAxes(vR, []int{0, 2, 1, 3}, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("v transpose: %w", err)
+	}
+	defer vT.Free()
+
+	ropeDims := int(float64(headDim) * float64(cfg.PartialRotaryFactor))
+	qRot, err := mlx.FastRoPEDynamic(qT.(*mlx.Array), ropeDims, false, cfg.RopeTheta, 1.0, pos.(*mlx.Array), nil, cd.streamM)
+	if err != nil {
+		return nil, nil, fmt.Errorf("q rope: %w", err)
+	}
+	defer qRot.Free()
+
+	kRot, err := mlx.FastRoPEDynamic(kT.(*mlx.Array), ropeDims, false, cfg.RopeTheta, 1.0, pos.(*mlx.Array), nil, cd.streamM)
+	if err != nil {
+		return nil, nil, fmt.Errorf("k rope: %w", err)
+	}
+	defer kRot.Free()
+
+	// Append this token's row: the buffers grow by exactly one position and
+	// every position is real, so no scatter predicate and no mask exist.
+	kUpd, err := b.ConcatenateAxis([]tensor.Array{kBuf, kRot}, 2, s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("k concat: %w", err)
+	}
+	vUpd, err := b.ConcatenateAxis([]tensor.Array{vBuf, vT}, 2, s)
+	if err != nil {
+		kUpd.Free()
+		return nil, nil, fmt.Errorf("v concat: %w", err)
+	}
+
+	scale := float32(1.0 / math.Sqrt(float64(headDim)))
+	ctx, err := b.FastScaledDotProductAttention(qRot, kUpd, vUpd, scale, "", nil, nil, s)
 	if err != nil {
 		kUpd.Free()
 		vUpd.Free()
