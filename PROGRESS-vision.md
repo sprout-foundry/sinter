@@ -398,6 +398,27 @@ at high iteration counts: the recurrent kernel measured 0.238ms/layer at 10
 chained iterations, 0.145 at 50, and 0.084 at 200. Always report the iteration
 count, and prefer full-model A/B ablations over isolated timings.
 
+**Isolating a sub-op inside a layer does not work — use block toggles.** Two
+attempts to price the pieces of the full-attention block failed, and both
+failed for reasons worth not rediscovering:
+
+- *Chaining the op on its own output* is impossible for the projections: a
+  `q_proj` producing 4096 columns cannot consume its own 4096-wide output as
+  a 2048-wide input. Feeding it a constant instead lets MLX's common
+  subexpression elimination collapse all N iterations into one op, which is
+  why an early run reported sub-ops *faster* at capacity 4096 than at 256 and
+  a 40µs sum against a 197µs block.
+- *Varying `pos` per iteration* defeats CSE for the scatter and the mask, but
+  then each iteration needs its own `Eval()`, which reinstates the per-call
+  command-buffer commit the caveat above warns about.
+
+The reliable shape is the one the MoE decomposition used: a toggle inside the
+real block, so the dataflow is genuine and the whole chain is evaluated once.
+`SINTER_ABLATE=attn|moe|delta` already does this at block granularity;
+sub-op toggles belong in the same place (`SINTER_ATTN_NOMASK` is the existing
+example) rather than in a standalone harness.
+
+
 **Profiled: the GPU is 95% busy during decode, so stalls are not the
 problem.** The handoff had two candidates for the ~400µs per layer: kernel
 serialization inside a layer, and the MoE gather being internally
