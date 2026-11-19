@@ -89,6 +89,15 @@ func (q *Qwen35) compiledLayer(h tensor.Array, layerIdx int, pos tensor.Array, s
 			b.RetainArray(stateIn[0]).(*mlx.Array),
 			b.RetainArray(stateIn[1]).(*mlx.Array),
 		}
+	} else if ablate("linearattn") && lw.linearAttn != nil {
+		// Scratch ablation: skip ONLY the DeltaNet layers. attn-vs-
+		// linearattn differences then isolate full attention alone,
+		// because ablate("attn") skips both branch kinds.
+		attnOut = b.RetainArray(normed)
+		updates = []*mlx.Array{
+			b.RetainArray(stateIn[0]).(*mlx.Array),
+			b.RetainArray(stateIn[1]).(*mlx.Array),
+		}
 	} else if lw.linearAttn != nil {
 		attnOut, updates, err = q.compiledDeltaLayer(normed, lw.linearAttn, stateIn)
 		if err != nil {
