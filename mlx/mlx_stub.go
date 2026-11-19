@@ -179,6 +179,9 @@ func ArgMaxAxis(a *Array, axis int, keepdims bool, s *Stream) (*Array, error) {
 func ArgPartitionAxis(*Array, int, int, *Stream) (*Array, error) {
 	return nil, errUnavailable
 }
+func ArgSortAxis(*Array, int, *Stream) (*Array, error) {
+	return nil, errUnavailable
+}
 func TakeAlongAxis(*Array, *Array, int, *Stream) (*Array, error) {
 	return nil, errUnavailable
 }

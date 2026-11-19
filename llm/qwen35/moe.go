@@ -307,6 +307,42 @@ func (m *sparseMoeBlock) router(xFlat tensor.Array, b tensor.Backend, s tensor.S
 		inds.Free()
 		return nil, nil, fmt.Errorf("moe score norm: %w", err)
 	}
+
+	// SINTER_MOE_SORTED=1: sort each token's expert indices ascending and
+	// permute the scores to match. gather_qmm's sorted_indices hint assumes
+	// the rhs indices are ordered, giving the gathered weight rows locality.
+	// The gather output rows follow the indices' order, so every use of inds
+	// (gate_up and down gathers) and of scores (the final weighting) must
+	// see the SAME permutation or the wrong score lands on the wrong expert.
+	if os.Getenv("SINTER_MOE_SORTED") == "1" {
+		if sa, ok := b.(interface {
+			ArgSortAxis(tensor.Array, int, tensor.Stream) (tensor.Array, error)
+		}); ok {
+			perm, err := sa.ArgSortAxis(inds, -1, s)
+			if err != nil {
+				normalized.Free()
+				inds.Free()
+				return nil, nil, fmt.Errorf("moe argsort: %w", err)
+			}
+			defer perm.Free()
+			sorted, err := b.TakeAlongAxis(inds, perm, -1, s)
+			if err != nil {
+				normalized.Free()
+				inds.Free()
+				return nil, nil, fmt.Errorf("moe sort take: %w", err)
+			}
+			permScores, err := b.TakeAlongAxis(normalized, perm, -1, s)
+			if err != nil {
+				sorted.Free()
+				normalized.Free()
+				inds.Free()
+				return nil, nil, fmt.Errorf("moe score permute: %w", err)
+			}
+			normalized.Free()
+			inds.Free()
+			return sorted, permScores, nil
+		}
+	}
 	return inds, normalized, nil
 }
 
@@ -401,12 +437,15 @@ func (m *sparseMoeBlock) forward(x tensor.Array, q *Qwen35) (tensor.Array, error
 	}
 	defer x4d.Free()
 
-	// inds is [BS, k] — these are the expert indices per token
+	// SINTER_MOE_SORTED=1 (see router): indices arrive sorted, so tell
+	// gather_qmm it may rely on that ordering.
+	sortedGather := os.Getenv("SINTER_MOE_SORTED") == "1"
+
 	var gateOut, upOut tensor.Array
 	if m.switchInProj != nil {
 		// Merged gate+up: one gather produces both halves of the
 		// intermediate axis, split back out here.
-		both, err := b.GatherQuantizedMatMul(x4d, m.switchInProj.QW(), m.switchInProj.QScales(), m.switchInProj.QBiases(), nil, inds, true, m.switchInProj.QGroupSize(), m.switchInProj.QBits(), m.switchInProj.QMode(), false, s)
+		both, err := b.GatherQuantizedMatMul(x4d, m.switchInProj.QW(), m.switchInProj.QScales(), m.switchInProj.QBiases(), nil, inds, true, m.switchInProj.QGroupSize(), m.switchInProj.QBits(), m.switchInProj.QMode(), sortedGather, s)
 		if err != nil {
 			return nil, fmt.Errorf("moe gather gate_up: %w", err)
 		}
@@ -429,10 +468,10 @@ func (m *sparseMoeBlock) forward(x tensor.Array, q *Qwen35) (tensor.Array, error
 			return nil, fmt.Errorf("moe split up: %w", err)
 		}
 	} else {
-		if gateOut, err = b.GatherQuantizedMatMul(x4d, m.switchGateProj.QW(), m.switchGateProj.QScales(), m.switchGateProj.QBiases(), nil, inds, true, m.switchGateProj.QGroupSize(), m.switchGateProj.QBits(), m.switchGateProj.QMode(), false, s); err != nil {
+		if gateOut, err = b.GatherQuantizedMatMul(x4d, m.switchGateProj.QW(), m.switchGateProj.QScales(), m.switchGateProj.QBiases(), nil, inds, true, m.switchGateProj.QGroupSize(), m.switchGateProj.QBits(), m.switchGateProj.QMode(), sortedGather, s); err != nil {
 			return nil, fmt.Errorf("moe gather gate_proj: %w", err)
 		}
-		if upOut, err = b.GatherQuantizedMatMul(x4d, m.switchUpProj.QW(), m.switchUpProj.QScales(), m.switchUpProj.QBiases(), nil, inds, true, m.switchUpProj.QGroupSize(), m.switchUpProj.QBits(), m.switchUpProj.QMode(), false, s); err != nil {
+		if upOut, err = b.GatherQuantizedMatMul(x4d, m.switchUpProj.QW(), m.switchUpProj.QScales(), m.switchUpProj.QBiases(), nil, inds, true, m.switchUpProj.QGroupSize(), m.switchUpProj.QBits(), m.switchUpProj.QMode(), sortedGather, s); err != nil {
 			gateOut.Free()
 			return nil, fmt.Errorf("moe gather up_proj: %w", err)
 		}
@@ -447,7 +486,7 @@ func (m *sparseMoeBlock) forward(x tensor.Array, q *Qwen35) (tensor.Array, error
 	}
 	defer actOut.Free()
 
-	downOut, err := b.GatherQuantizedMatMul(actOut, m.switchDownProj.QW(), m.switchDownProj.QScales(), m.switchDownProj.QBiases(), nil, inds, true, m.switchDownProj.QGroupSize(), m.switchDownProj.QBits(), m.switchDownProj.QMode(), false, s)
+	downOut, err := b.GatherQuantizedMatMul(actOut, m.switchDownProj.QW(), m.switchDownProj.QScales(), m.switchDownProj.QBiases(), nil, inds, true, m.switchDownProj.QGroupSize(), m.switchDownProj.QBits(), m.switchDownProj.QMode(), sortedGather, s)
 	if err != nil {
 		return nil, fmt.Errorf("moe gather down_proj: %w", err)
 	}

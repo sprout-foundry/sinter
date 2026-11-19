@@ -35,6 +35,15 @@ func ArgPartitionAxis(a *Array, kth, axis int, s *Stream) (*Array, error) {
 	return wrapResult(out, rc, "argpartition_axis")
 }
 
+// ArgSortAxis returns indices that would sort the array along the given axis.
+// Used to sort MoE expert indices so gather_qmm's sorted_indices hint can
+// apply (sorted rhs indices give the gathered rows weight locality).
+func ArgSortAxis(a *Array, axis int, s *Stream) (*Array, error) {
+	out := newOutput()
+	rc := C.mlx_argsort_axis(&out, a.cHandle(), C.int(axis), s.cHandle())
+	return wrapResult(out, rc, "argsort_axis")
+}
+
 // TakeAlongAxis gathers elements from a using indices along the given axis.
 // Used for MoE top-k score extraction.
 func TakeAlongAxis(a, indices *Array, axis int, s *Stream) (*Array, error) {

@@ -28,6 +28,10 @@ int mlx_argpartition_axis(mlx_array* res, const mlx_array a, int kth, int axis, 
   if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return 1; }
   return mlx_dispatch.mlx_argpartition_axis(res, a, kth, axis, s);
 }
+int mlx_argsort_axis(mlx_array* res, const mlx_array a, int axis, const mlx_stream s) {
+  if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return 1; }
+  return mlx_dispatch.mlx_argsort_axis(res, a, axis, s);
+}
 const float* mlx_array_data_float32(const mlx_array arr) {
   if (!mlx_shim_ready()) { mlx_shim_report_notloaded(); return NULL; }
   return mlx_dispatch.mlx_array_data_float32(arr);

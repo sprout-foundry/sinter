@@ -519,10 +519,16 @@ Two blocks dominate the step, in this order:
    (~5.6ms/token isolated across 40 layers), reading 12.6MB at 90 GB/s. The
    `gather_qmm` slot sweep says the call is fixed-cost dominated (k=1 and k=8
    cost the same), so the lever is per-call overhead, not bytes — and that
-   overhead is inside MLX, not reachable from Go. `sorted_indices` is the one
-   documented hint still untested; it needs an argsort binding. Note mlx-lm
-   uses *two* `gather_qmm` calls here where sinter merges to one, so this
-   block is not where sinter loses to mlx-lm.
+   overhead is inside MLX, not reachable from Go. **`sorted_indices` is now
+   tested and dead**: the argsort binding was added
+   (`mlx.ArgSortAxis`/`ArgSortAxis`, shim regenerated), the router sorts each
+   token's expert indices and permutes the scores to match
+   (`SINTER_MOE_SORTED=1`), all five gather sites pass the flag, token ids
+   are bit-identical — and interleaved best-of-3 measures **−0.3% on the 4B
+   and −3.9% on the 35B**. The argsort + two take_along per layer costs more
+   than the locality hint saves; index ordering is not a lever, on any model
+   size. Note mlx-lm uses *two* `gather_qmm` calls here where sinter merges
+   to one, so this block is not where sinter loses to mlx-lm.
 2. **Full attention — 2.66ms of real GPU work per token (266µs/block, 51
    GB/s), plus ~2.6ms of critical-path latency.** The isolated block is 8x
    off its 400 GB/s floor. Two measured differences from mlx-lm: the additive

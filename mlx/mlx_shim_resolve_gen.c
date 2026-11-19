@@ -19,6 +19,8 @@ int mlx_shim_resolve_dispatch(void* handle, mlx_shim_dispatch_t* d) {
   if (!p) return 0; d->mlx_argmax_axis = (int (*)(mlx_array* res, const mlx_array a, int axis, bool keepdims, const mlx_stream s))p;
   p = dlsym(handle, "mlx_argpartition_axis");
   if (!p) return 0; d->mlx_argpartition_axis = (int (*)(mlx_array* res, const mlx_array a, int kth, int axis, const mlx_stream s))p;
+  p = dlsym(handle, "mlx_argsort_axis");
+  if (!p) return 0; d->mlx_argsort_axis = (int (*)(mlx_array* res, const mlx_array a, int axis, const mlx_stream s))p;
   p = dlsym(handle, "mlx_array_data_float32");
   if (!p) return 0; d->mlx_array_data_float32 = (const float* (*)(const mlx_array arr))p;
   p = dlsym(handle, "mlx_array_data_int64");

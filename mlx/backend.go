@@ -322,6 +322,10 @@ func (b *MetalBackend) ArgPartitionAxis(a tensor.Array, kth, axis int, s tensor.
 	return ArgPartitionAxis(a.(*Array), kth, axis, toStream(s))
 }
 
+func (b *MetalBackend) ArgSortAxis(a tensor.Array, axis int, s tensor.Stream) (tensor.Array, error) {
+	return ArgSortAxis(a.(*Array), axis, toStream(s))
+}
+
 func (b *MetalBackend) TakeAlongAxis(a, indices tensor.Array, axis int, s tensor.Stream) (tensor.Array, error) {
 	return TakeAlongAxis(a.(*Array), indices.(*Array), axis, toStream(s))
 }
