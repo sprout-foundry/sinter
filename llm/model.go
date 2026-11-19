@@ -457,6 +457,13 @@ type GenerateConfig struct {
 	// steps, so the verify batches and prefix snapshots cost more than the
 	// accepted drafts save.
 	PromptLookupMaxDrafts int
+	// IgnoreEOS keeps generating past the model's end-of-sequence token
+	// instead of stopping. Benchmark harnesses that need a fixed number of
+	// decode steps set it so every variant does identical work — an
+	// ablation that destroys the model emits EOS on the first step, and a
+	// loop that honours it measures one step instead of the requested
+	// count. Never set it for real generation.
+	IgnoreEOS bool
 	// ThinkingTokens determines whether to include <think>...</think> blocks
 	// in the output. When false (default), thinking tokens are filtered.
 	ThinkingTokens bool
@@ -999,7 +1006,7 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if m.isStopToken(nextToken) {
+			if !genCfg.IgnoreEOS && m.isStopToken(nextToken) {
 				break
 			}
 
@@ -1072,7 +1079,7 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 				pending.Free()
 				return err
 			}
-			if m.isStopToken(nextToken) {
+			if !genCfg.IgnoreEOS && m.isStopToken(nextToken) {
 				pending.Free()
 				break
 			}
@@ -1145,7 +1152,7 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 				pending.Free()
 				return err
 			}
-			if m.isStopToken(nextToken) {
+			if !genCfg.IgnoreEOS && m.isStopToken(nextToken) {
 				pending.Free()
 				break
 			}
@@ -1219,7 +1226,7 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if m.isStopToken(nextToken) {
+			if !genCfg.IgnoreEOS && m.isStopToken(nextToken) {
 				break
 			}
 
@@ -1346,7 +1353,7 @@ func (m *Model) generateLockedParts(ctx context.Context, prompt string, parts []
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if m.isStopToken(nextToken) {
+		if !genCfg.IgnoreEOS && m.isStopToken(nextToken) {
 			break
 		}
 

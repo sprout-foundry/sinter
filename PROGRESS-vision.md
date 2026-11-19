@@ -83,10 +83,11 @@ sequence, the DeltaNet recurrence, or the MoE — not in the buffer design.
 mlx-lm loses nothing over the same range, so whatever it is, mlx-lm is not
 paying it.
 
-That narrows the target to a per-token cost that grows with sequence length
-and is common to both of sinter's decode paths. Nothing measured yet
-separates those three candidates; the ablation hooks (`SINTER_ABLATE=attn|
-moe|delta`, see zz_ablate_test.go) at both prompt lengths are the way to.
+That narrowed the target to a per-token cost that grows with sequence length
+and is common to both of sinter's decode paths. **The ablation has now
+pinned it to full attention** — see "Attention is what makes the step grow
+with context" below. Attention accounts for 107% of the growth; the MoE and
+DeltaNet are flat.
 
 What survives from the earlier investigation is the **source reading**, which
 does not depend on mlx-lm being runnable:
@@ -174,7 +175,27 @@ so the model runs at roughly a quarter of peak bandwidth and **no single
 block is close to its own floor**: the MoE moves 660MB in 7.6ms (87 GB/s),
 full attention 136MB in 5.3ms (26 GB/s).
 
-**The MoE block is dominated by the two routed-expert gathers.** Chained the
+**Attention is what makes the step grow with context.** The same ablation on
+the 4B at both prompt lengths (`TestScratchAblateSteps`, which forces a fixed
+step count via `GenerateConfig.IgnoreEOS` so an ablation that destroys the
+model still costs the same number of steps — `TestScratchAblate` cannot price
+`attn` or `moe` because both stop on the first token):
+
+| component | short (~63 tok) | long (~2500 tok) | change |
+|---|---|---|---|
+| full attention (8 layers) | 4.77 ms (40%) | 5.91 ms (45%) | **+1.14** |
+| MoE (24 layers) | 4.75 ms (40%) | 4.60 ms (35%) | −0.15 |
+| DeltaNet (24 layers) | 0.80 ms (7%) | 0.88 ms (7%) | +0.08 |
+| **whole step** | **11.94** | **13.19** | **+1.25** |
+
+Attention accounts for **107%** of the growth (the MoE slightly shrinks,
+inside noise) and the other two are flat. That is the whole context-dependent
+gap: sinter loses ~1.25ms/token going to a 2500-token prompt and attention is
+all of it. The per-token growth is far larger than the ~1ms the earlier
+estimate gave attention, and it is the term to attack — mlx-lm is flat over
+the same range, so it is not paying this.
+
+The MoE block is dominated by the two routed-expert gathers. Chained the
 same way (`TestScratchMoeChain`, `SINTER_MOE_VARIANT` for the sub-groups),
 the block is 270-300µs, and the variants separate it:
 
